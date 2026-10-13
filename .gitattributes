@@ -1,0 +1,13 @@
+# Normalise line endings in the repository.
+* text=auto
+
+# Shell scripts run inside Linux containers: a Windows CRLF line ending breaks them
+# ("/bin/sh^M: not found"), so force LF regardless of the checkout platform.
+*.sh text eol=lf
+Dockerfile text eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.docx binary
+*.ico binary

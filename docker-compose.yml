@@ -1,0 +1,42 @@
+# Local development services.
+#
+#   docker compose up -d db                  # just the database (normal development)
+#   docker compose --profile full up --build # database + API container (tests the deploy image)
+
+services:
+  db:
+    # Same pgvector extension Supabase provides, on stock Postgres.
+    image: pgvector/pgvector:pg16
+    container_name: clauselens-db
+    environment:
+      POSTGRES_USER: clauselens
+      POSTGRES_PASSWORD: clauselens # local-only credential; never used in production
+      POSTGRES_DB: clauselens
+    ports:
+      - "5432:5432"
+    volumes:
+      - clauselens-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clauselens -d clauselens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    profiles: ["full"]
+    build: ./backend
+    container_name: clauselens-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://clauselens:clauselens@db:5432/clauselens
+      CORS_ORIGINS: http://localhost:3000
+      LOG_FORMAT: text
+      RUN_MIGRATIONS_ON_START: "true"
+    ports:
+      - "8000:7860"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  clauselens-pgdata:

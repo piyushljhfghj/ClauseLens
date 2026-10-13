@@ -1,0 +1,11 @@
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+tests/
+# Local uploaded files (STORAGE_BACKEND=local) must never be baked into the image.
+storage/
