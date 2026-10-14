@@ -9,16 +9,18 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
-from sqlalchemy import update
+from sqlalchemy import event, update
+from sqlalchemy import text as text_interval
+from sqlalchemy.exc import OperationalError
 
 from app.answering.prompt import INSUFFICIENT_ANSWER
 from app.core.config import Settings
-from app.db.models import Document, DocumentText
+from app.db.models import Document, DocumentPage, DocumentText
 from app.db.session import get_engine, get_sessionmaker
 from app.ingestion import pdf_extract
 from app.ingestion.model import SourceBlock, SourceLine, SourceWord
-from app.ingestion.ocr import OcrResult
-from app.llm import ChatMessage, LLMUnavailableError, OpenAICompatibleClient
+from app.ingestion.ocr import OcrResult, tesseract_version
+from app.llm import ChatMessage, LLMResult, LLMUnavailableError, OpenAICompatibleClient
 from app.main import create_app
 from tests.conftest import truncate_all
 from tests.fakes import ConceptEmbedder, FakeLLM, answer_output, evidence_in
@@ -26,6 +28,7 @@ from tests.fixtures import factory
 from tests.test_retrieval import CONTRACT_A, CONTRACT_B, contract_pdf
 
 ANSWERS = "/api/answers"
+needs_tesseract = pytest.mark.skipif(tesseract_version() is None, reason="Tesseract not installed")
 MISSING = "00000000-0000-0000-0000-000000000001"
 QUOTE_A = "shall not exceed AED 100,000"
 QUOTE_B = "shall not exceed AED 1,000,000"
@@ -758,3 +761,333 @@ async def test_split_word_quote_is_verified_and_flagged_end_to_end(
     text = await canonical(document)
     assert text[citation["char_start"] : citation["char_end"]] == citation["quote"]
     assert citation["quality"]["level"] == "not_applicable"  # DOCX: no pages
+
+
+# --- PDF highlight rectangles (Phase 6, task 4) ---------------------------------------------------
+
+
+async def stored_page(document_id: str, page: int) -> DocumentPage:
+    async with get_sessionmaker()() as session:
+        row = await session.get(DocumentPage, (uuid.UUID(document_id), page))
+        assert row is not None
+        return row
+
+
+def covering(page: DocumentPage, start: int, end: int) -> list[list[float]]:
+    return [w for w in page.words if w[0] < end and start < w[1]]
+
+
+async def test_verified_pdf_quote_gets_a_line_rectangle_from_stored_word_boxes(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        quote = "Either party may terminate this Agreement"
+        # The model's page claim is ignored: the rectangle comes from the verified offsets.
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": quote, "page": 1}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "verified" and citation["reason"] is None
+    page = await stored_page(contract, 2)
+    words = covering(page, citation["char_start"], citation["char_end"])
+    assert len(words) == 6  # Either party may terminate this Agreement
+    assert citation["highlights"] == [
+        {
+            "page": 2,
+            "page_width": page.width,
+            "page_height": page.height,
+            "x0": min(w[2] for w in words),
+            "y0": min(w[3] for w in words),
+            "x1": max(w[4] for w in words),
+            "y1": max(w[5] for w in words),
+        }
+    ]
+
+
+async def test_quote_over_lines_and_a_page_break_gets_rectangles_per_line_and_page(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    document = await upload(api, answer_app, "delivery.pdf", factory.furniture_pdf(pages=3))
+    text = await canonical(document)
+    quote = (
+        "on all matters. The Supplier shall deliver the goods within ten (10) business days of "
+        "the order. Clause 2 text"
+    )
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Clause 2 text")
+        return answer_output(
+            "Delivery is due within ten business days [1].",
+            [{"n": 1, "evidence": e, "quote": quote}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "When must the Supplier deliver the goods?", document))["citations"][
+        0
+    ]
+    assert citation["status"] == "verified"
+    assert (citation["page_start"], citation["page_end"]) == (1, 2)
+    highlights = citation["highlights"]
+    assert {h["page"] for h in highlights} == {1, 2}
+    # One rectangle per line of the quote: count the line breaks it crosses on each page.
+    matched = text[citation["char_start"] : citation["char_end"]]
+    before_break, after_break = matched.split("\n\n")
+    assert len([h for h in highlights if h["page"] == 1]) == before_break.count("\n") + 1
+    assert len([h for h in highlights if h["page"] == 2]) == after_break.count("\n") + 1
+    for h in highlights:
+        page = await stored_page(document, h["page"])
+        assert (h["page_width"], h["page_height"]) == (page.width, page.height)
+        assert 0 <= h["x0"] < h["x1"] <= page.width and 0 <= h["y0"] < h["y1"] <= page.height
+    # The running header was removed as page furniture: it is not text, so never highlighted.
+    assert "ACME CORP" not in text
+
+
+async def test_running_header_quote_is_never_verified_or_highlighted(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    document = await upload(api, answer_app, "header.pdf", factory.furniture_pdf(pages=3))
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "deliver the goods")
+        return answer_output(
+            "The document is confidential [1].",
+            [{"n": 1, "evidence": e, "quote": "ACME CORP - CONFIDENTIAL"}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "When must the Supplier deliver the goods?", document))["citations"][
+        0
+    ]
+    assert citation["status"] == "unverified" and citation["highlights"] == []
+
+
+async def test_repeated_text_is_highlighted_where_the_verifier_located_it(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    # The pricing sentence is on pages 5 and 6; outside the evidence, the first is reported
+    # (and flagged ambiguous), so only page 5 is highlighted.
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Pricing follows the Order Form [1].",
+            [{"n": 1, "evidence": e, "quote": PRICING_QUOTE}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["location_ambiguous"] and citation["page_start"] == 5
+    assert citation["highlights"] and {h["page"] for h in citation["highlights"]} == {5}
+    page = await stored_page(contract, 5)
+    words = covering(page, citation["char_start"], citation["char_end"])
+    assert min(w[3] for w in words) == min(h["y0"] for h in citation["highlights"])
+
+
+async def test_unverified_quotes_and_word_documents_get_no_rectangles(
+    api: httpx.AsyncClient, contract: str, essay: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Termination needs 90 days [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate on ninety days notice"}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "unverified" and citation["highlights"] == []
+
+    llm.script = book_script(f"The book is {TITLE} [1].", [(1, QUOTE_TITLE)])
+    docx = (await ask(api, BOOK_QUESTION, essay))["citations"][0]
+    assert docx["status"] == "verified" and docx["highlights"] == []
+    assert docx["reason"] is None  # no pages: nothing to highlight, nothing to explain
+
+
+async def test_missing_word_geometry_keeps_the_quote_verified_without_rectangles(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            update(DocumentPage)
+            .where(DocumentPage.document_id == uuid.UUID(contract), DocumentPage.page_number == 2)
+            .values(words=[])
+        )
+        await session.commit()
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "verified" and citation["page_start"] == 2
+    assert citation["highlights"] == []
+    assert "could not be determined from the extracted layout" in citation["reason"]
+
+
+async def test_document_reprocessed_during_the_answer_gets_no_rectangles(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"}],
+        )
+
+    llm.script = script
+    complete = llm.complete
+
+    async def reprocessed_meanwhile(messages: list[ChatMessage]) -> LLMResult:
+        async with get_sessionmaker()() as session:  # as if a re-index committed mid-answer
+            await session.execute(
+                update(Document)
+                .where(Document.id == uuid.UUID(contract))
+                .values(processed_at=text_interval("now() + interval '1 minute'"))
+            )
+            await session.commit()
+        return await complete(messages)
+
+    llm.complete = reprocessed_meanwhile  # type: ignore[method-assign]
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "verified" and citation["highlights"] == []
+    assert "could not be determined" in citation["reason"]
+
+
+@needs_tesseract
+async def test_ocr_page_quote_is_highlighted_in_the_same_coordinates(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    document = await upload(api, answer_app, "scan.pdf", factory.scanned_pdf(pages=1))
+    page = await stored_page(document, 1)
+    assert page.extraction == "ocr" and page.words
+    text = await canonical(document)
+    quote = " ".join(text.split()[:6])  # the OCR text itself, so the quote verifies
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = next(iter(evidence_in(messages)))
+        return answer_output("The clause says so [1].", [{"n": 1, "evidence": e, "quote": quote}])
+
+    llm.script = script
+    result = await ask(api, " ".join(text.split()[:4]), document)
+    citation = result["citations"][0]
+    assert citation["status"] == "verified"
+    words = covering(page, citation["char_start"], citation["char_end"])
+    highlights = citation["highlights"]
+    assert highlights and {h["page"] for h in highlights} == {1}
+    assert all((h["page_width"], h["page_height"]) == (page.width, page.height) for h in highlights)
+    assert min(h["x0"] for h in highlights) == min(w[2] for w in words)
+    assert max(h["x1"] for h in highlights) == max(w[4] for w in words)
+
+
+async def test_only_the_cited_pages_geometry_is_loaded_for_a_large_document(
+    api: httpx.AsyncClient, answer_app: FastAPI, contract: str, llm: FakeLLM
+) -> None:
+    large = await upload(api, answer_app, "large.pdf", factory.large_pdf_with_needle())
+    statements: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        if "document_pages.words" in statement and "documents.processed_at" in statement:
+            statements.append((statement, parameters))
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Escrow Agent")
+        return answer_output(
+            "The deposit is released within seven days [1].",
+            [{"n": 1, "evidence": e, "quote": factory.NEEDLE}],
+        )
+
+    llm.script = script
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = await ask(api, "When does the Escrow Agent release the Deposit?", large, contract)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    citation = result["citations"][0]
+    assert citation["status"] == "verified" and citation["page_start"] == 137
+    assert {h["page"] for h in citation["highlights"]} == {137}
+    # One geometry query, for the cited document's page only: not the other 149 pages, and
+    # nothing from the other selected document.
+    assert len(statements) == 1
+    parameters = [str(p) for p in statements[0][1]]  # type: ignore[union-attr]
+    assert large in parameters and contract not in parameters
+    assert "137" in parameters and len(parameters) == 2
+
+
+def fail_geometry_query(error: Exception):  # type: ignore[no-untyped-def]
+    """A cursor hook that raises `error` for the highlight geometry query only."""
+
+    def hook(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        if "document_pages.words" in statement and "documents.processed_at" in statement:
+            raise error
+
+    return hook
+
+
+async def test_geometry_read_failure_keeps_the_verified_answer(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"}],
+        )
+
+    llm.script = script
+    hook = fail_geometry_query(OperationalError("SELECT ...", {}, OSError("connection lost")))
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", hook)
+    try:
+        response = await api.post(
+            ANSWERS,
+            json={"question": "How can the agreement be terminated?", "document_ids": [contract]},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", hook)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["grounding"] == "grounded"
+    assert result["answer"] == "Either party may terminate [1]."
+    citation = result["citations"][0]
+    assert citation["status"] == "verified" and citation["page_start"] == 2
+    assert citation["quote"] == "Either party may terminate this Agreement"
+    text = await canonical(contract)
+    assert text[citation["char_start"] : citation["char_end"]] == citation["quote"]
+    assert citation["highlights"] == []  # nothing fabricated
+    assert citation["reason"] == (
+        "Its position on the page could not be loaded just now, so it is not highlighted."
+    )
+    assert get_engine().pool.checkedout() == 0  # the failed read released its connection
+
+
+async def test_unexpected_errors_in_the_geometry_step_are_not_hidden(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"}],
+        )
+
+    llm.script = script
+    hook = fail_geometry_query(RuntimeError("a bug, not a database failure"))
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", hook)
+    try:
+        response = await api.post(
+            ANSWERS,
+            json={"question": "How can the agreement be terminated?", "document_ids": [contract]},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", hook)
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "INTERNAL_ERROR"

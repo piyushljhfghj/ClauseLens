@@ -11,12 +11,14 @@ model's draft separately for transparency.
 
 import asyncio
 import bisect
+import contextlib
 import logging
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.answering.context import select_context
@@ -24,7 +26,7 @@ from app.answering.integrity import corruption, degenerate_repetition, uncited_s
 from app.answering.parser import ProposedCitation, parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.core.config import Settings
-from app.db.models import DocumentPage, DocumentText
+from app.db.models import Document, DocumentPage, DocumentText
 from app.embeddings import Embedder
 from app.ingestion.model import LOW_QUALITY_NOTE
 from app.llm import INCOMPLETE_OUTPUT, LLMClient, LLMNotConfiguredError, LLMOutputInvalidError
@@ -35,8 +37,10 @@ from app.schemas.answers import (
     EvidenceOut,
     ExcludedPassage,
     Grounding,
+    HighlightRect,
 )
 from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
+from app.verification.geometry import PageGeometry, highlight_boxes
 from app.verification.normalize import normalize
 from app.verification.quotes import EvidenceText, QuoteCheck, SourceDocument, verify_quote
 
@@ -60,6 +64,15 @@ class PageRecord:
 
 
 PageRecords = dict[uuid.UUID, list[PageRecord]]  # document -> its pages, in page order
+Versions = dict[uuid.UUID, object]  # document -> processed_at of the snapshot answered from
+
+NOT_HIGHLIGHTED = (
+    "Its position on the page could not be determined from the extracted layout, so it is not "
+    "highlighted."
+)
+HIGHLIGHTS_UNAVAILABLE = (
+    "Its position on the page could not be loaded just now, so it is not highlighted."
+)
 
 
 class AnswerService:
@@ -88,7 +101,7 @@ class AnswerService:
         selection = select_context(retrieval.passages, settings, tuple(retrieval.analysis.terms))
         # Verification searches the whole text of each document that evidence came from. It is
         # read in the same snapshot as the passages, so their offsets agree.
-        sources, pages = await self._load_documents(selection.selected)
+        sources, pages, versions = await self._load_documents(selection.selected)
         # End the read-only snapshot now: the LLM call can take seconds and must not hold a
         # database connection. Everything verification needs is already in memory.
         await self._session.rollback()
@@ -176,6 +189,7 @@ class AnswerService:
         citations = await asyncio.to_thread(
             lambda: [self._verify(c, evidence, sources, pages) for c in parsed.citations]
         )
+        citations = await self._add_highlights(citations, sources, versions)
         grounding, grounding_notes = _grounding(
             parsed.markers, citations, uncited_statements(parsed.answer)
         )
@@ -203,11 +217,16 @@ class AnswerService:
 
     async def _load_documents(
         self, passages: list[RetrievedPassage]
-    ) -> tuple[dict[uuid.UUID, SourceDocument], PageRecords]:
-        """Canonical text and page records of every document the evidence comes from."""
+    ) -> tuple[dict[uuid.UUID, SourceDocument], PageRecords, Versions]:
+        """Canonical text, page records and processing version of every document the evidence
+        comes from."""
         document_ids = sorted({p.document_id for p in passages}, key=str)
         if not document_ids:
-            return {}, {}
+            return {}, {}, {}
+        version_rows = await self._session.execute(
+            select(Document.id, Document.processed_at).where(Document.id.in_(document_ids))
+        )
+        versions: Versions = {row.id: row.processed_at for row in version_rows}
         texts = await self._session.execute(
             select(DocumentText.document_id, DocumentText.canonical_text).where(
                 DocumentText.document_id.in_(document_ids)
@@ -241,7 +260,78 @@ class AnswerService:
                     row.ocr_confidence,
                 )
             )
-        return sources, dict(pages)
+        return sources, dict(pages), versions
+
+    async def _add_highlights(
+        self,
+        citations: list[CitationOut],
+        sources: dict[uuid.UUID, SourceDocument],
+        versions: Versions,
+    ) -> list[CitationOut]:
+        """Highlight rectangles for verified PDF citations, from the stored word boxes of only
+        the pages they are on. Read after the LLM call (the answer's snapshot is closed), so a
+        document reprocessed meanwhile (different `processed_at`) gets no rectangles rather than
+        boxes from another version of its text."""
+        wanted: dict[uuid.UUID, set[int]] = defaultdict(set)
+        for c in citations:
+            if c.status == "verified" and c.document_id and c.page_start and c.page_end:
+                wanted[c.document_id].update(range(c.page_start, c.page_end + 1))
+        if not wanted:
+            return citations
+        try:
+            rows = (
+                await self._session.execute(
+                    select(
+                        DocumentPage.document_id,
+                        DocumentPage.page_number,
+                        DocumentPage.width,
+                        DocumentPage.height,
+                        DocumentPage.char_start,
+                        DocumentPage.char_end,
+                        DocumentPage.words,
+                        Document.processed_at,
+                    )
+                    .join(Document, Document.id == DocumentPage.document_id)
+                    .where(
+                        or_(
+                            *(
+                                and_(
+                                    DocumentPage.document_id == document_id,
+                                    DocumentPage.page_number.in_(sorted(numbers)),
+                                )
+                                for document_id, numbers in wanted.items()
+                            )
+                        )
+                    )
+                )
+            ).all()
+        except (SQLAlchemyError, OSError) as exc:
+            # Rectangles are optional: a failed read must not lose an answer that is already
+            # generated and verified. Only database/connection errors are caught here.
+            logger.warning("Highlight geometry unavailable", extra={"error": type(exc).__name__})
+            with contextlib.suppress(SQLAlchemyError, OSError):
+                await self._session.rollback()
+            return [
+                _note(c, HIGHLIGHTS_UNAVAILABLE) if _needs_geometry(c) else c for c in citations
+            ]
+        geometry: dict[uuid.UUID, list[PageGeometry]] = defaultdict(list)
+        stale: set[uuid.UUID] = set()
+        for row in rows:
+            if row.processed_at != versions.get(row.document_id):
+                stale.add(row.document_id)
+                continue
+            geometry[row.document_id].append(
+                PageGeometry(
+                    row.page_number,
+                    row.width,
+                    row.height,
+                    row.char_start,
+                    row.char_end,
+                    row.words or [],
+                )
+            )
+        await self._session.rollback()  # a short read; hold no connection afterwards
+        return [_with_highlights(c, sources, geometry, stale) for c in citations]
 
     def _verify(
         self,
@@ -284,6 +374,55 @@ class AnswerService:
             reason=reason,
             **base,
         )
+
+
+def _needs_geometry(citation: CitationOut) -> bool:
+    """A verified quote located on PDF pages (Word documents have no pages)."""
+    return citation.status == "verified" and bool(citation.page_start and citation.page_end)
+
+
+def _note(citation: CitationOut, note: str) -> CitationOut:
+    """The citation with `note` appended to its reason; nothing else changes."""
+    reason = f"{citation.reason} {note}" if citation.reason else note
+    return citation.model_copy(update={"reason": reason})
+
+
+def _with_highlights(
+    citation: CitationOut,
+    sources: dict[uuid.UUID, SourceDocument],
+    geometry: dict[uuid.UUID, list[PageGeometry]],
+    stale: set[uuid.UUID],
+) -> CitationOut:
+    """The citation with its highlight rectangles, or with a note that it cannot be placed."""
+    if not _needs_geometry(citation):
+        return citation  # unverified, or a Word document (no pages)
+    assert citation.page_start and citation.page_end
+    assert citation.document_id and citation.char_start is not None
+    assert citation.char_end is not None
+    boxes = None
+    source = sources.get(citation.document_id)
+    if source is not None and citation.document_id not in stale:
+        pages = [
+            g
+            for g in geometry.get(citation.document_id, [])
+            if citation.page_start <= g.page_number <= citation.page_end
+        ]
+        boxes = highlight_boxes(source.text, citation.char_start, citation.char_end, pages)
+    if not boxes:
+        return _note(citation, NOT_HIGHLIGHTED)
+    rects = [
+        HighlightRect(
+            page=b.page_number,
+            page_width=b.page_width,
+            page_height=b.page_height,
+            x0=b.x0,
+            y0=b.y0,
+            x1=b.x1,
+            y1=b.y1,
+        )
+        for b in boxes
+    ]
+    return citation.model_copy(update={"highlights": rects})
 
 
 def _location_reason(check: QuoteCheck, cited_evidence_id: str, filename: str) -> str | None:

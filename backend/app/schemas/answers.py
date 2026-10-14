@@ -42,6 +42,18 @@ class EvidenceOut(BaseModel):
     quality: PassageQuality
 
 
+class HighlightRect(BaseModel):
+    """One highlight rectangle: a line of a verified quote on a PDF page."""
+
+    page: int = Field(description="1-based page number, as in `page_start` / `page_end`.")
+    page_width: float = Field(description="Displayed page width in PDF points.")
+    page_height: float = Field(description="Displayed page height in PDF points.")
+    x0: float = Field(description="Left, in PDF points from the page's left edge.")
+    y0: float = Field(description="Top, in PDF points from the page's top edge (y grows down).")
+    x1: float
+    y1: float
+
+
 class CitationOut(BaseModel):
     n: int = Field(description="Marker number used in the answer text, e.g. [1].")
     status: Literal["verified", "unverified"]
@@ -57,6 +69,13 @@ class CitationOut(BaseModel):
     page_start: int | None = None
     page_end: int | None = None
     quality: PassageQuality | None = None
+    highlights: list[HighlightRect] = Field(
+        default_factory=list,
+        description="Verified PDF quotes only: one rectangle per text line, on every page the "
+        "quote spans, in displayed-page coordinates (rotation applied, origin top-left). Empty "
+        "for unverified quotes, Word documents, or when the stored layout cannot place the quote "
+        "reliably (then `reason` says so).",
+    )
     occurrence_count: int | None = Field(
         default=None,
         description="How many times the quote occurs (as whole words) in its document.",
