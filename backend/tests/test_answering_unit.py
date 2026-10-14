@@ -906,3 +906,175 @@ def test_location_reasons() -> None:
     reason = _location_reason(location("document", True, 3), "E1", "a.pdf") or ""
     assert reason.startswith("Found elsewhere in a.pdf, outside the passages the model was given")
     assert "It occurs 3 times outside those passages" in reason
+
+
+# --- extraction differences: line-break hyphens and spacing (Phase 6, task 3) -------------------
+
+NLC = chr(10)
+EXTRACTED = (
+    "1. This Agreement is made between the parties. The Agreement binds both. "
+    "2. Each party shall sign this Agree ment before the Effective Date of the contract. "
+    "3. Any non-" + NLC + "compete term ends after twelve months. "
+    "4. The Supplier may termi-" + NLC + "nate on notice to the other party in writing. "
+    "5. The therapist attends weekly. Later, the rapist was named in the report filed. "
+    "6. Payment of AED 1 000 is due under clause 8 2 within the agreed period of time. "
+    "7. The Supplier" + RSQUO + "s liability under this Agreement , is capped. "
+    "8. Liability" + chr(0x2014) + NLC + "subject to clause 9 is several. "
+    "9. The noticeperiod is thirty days unless the parties otherwise agree in writing. "
+    "10. Interest under clause 8. 2 of the Schedule accrues monthly on any late sums. "
+    "11. It is not able to assign. A notable exception applies to assignments in all cases."
+)
+
+
+def check_extracted(quote: str, text: str = EXTRACTED) -> QuoteCheck:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, text[:30])}
+    check = verify_quote(quote, "E1", evidence, {DOC_A: SourceDocument(DOC_A, text)})
+    if check.verified:  # offsets always point at the document's own characters
+        assert text[check.char_start : check.char_end] == check.matched_text
+    return check
+
+
+@pytest.mark.parametrize(
+    ("quote", "expected", "match_type"),
+    [
+        (
+            "Any non-compete term ends after twelve months",
+            "Any non-" + NLC + "compete term ends after twelve months",
+            "line_hyphen",
+        ),
+        (  # the joined form still matches exactly, as before
+            "Any noncompete term ends after twelve months",
+            "Any non-" + NLC + "compete term ends after twelve months",
+            "exact",
+        ),
+        (
+            "The Supplier may terminate on notice",
+            "The Supplier may termi-" + NLC + "nate on notice",
+            "exact",
+        ),
+        (  # a dash at a line break separates two words
+            "Liability-subject to clause 9 is several",
+            "Liability" + chr(0x2014) + NLC + "subject to clause 9 is several",
+            "line_hyphen",
+        ),
+        ("subject to clause 9 is several.", "subject to clause 9 is several.", "line_hyphen"),
+    ],
+)
+def test_hyphens_at_line_breaks(quote: str, expected: str, match_type: str) -> None:
+    check = check_extracted(quote)
+    assert check.verified and check.matched_text == expected and check.match_type == match_type
+
+
+def test_part_of_a_hyphenated_word_across_a_line_break_is_rejected() -> None:
+    check = check_extracted("compete term ends after twelve months")
+    assert not check.verified and "middle of a word" in (check.reason or "")
+
+
+def test_a_word_split_by_extraction_is_matched_with_exact_offsets() -> None:
+    check = check_extracted("sign this Agreement before the Effective Date")
+    assert check.verified and check.match_type == "spacing"
+    assert check.matched_text == "sign this Agree ment before the Effective Date"
+    assert check.char_start == EXTRACTED.index("sign this Agree ment")
+
+
+def test_spacing_around_punctuation_is_tolerated() -> None:
+    check = check_extracted("The Supplier's liability under this Agreement, is capped")
+    assert check.verified and check.match_type == "spacing"
+    assert check.matched_text == f"The Supplier{RSQUO}s liability under this Agreement , is capped"
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "Later, therapist was named in the report filed",  # "the rapist": two real words
+        "It is notable to assign. A notable exception applies",  # "not able" is two words
+        "The notice period is thirty days unless the parties",  # source runs words together
+        "Payment of AED 1000 is due under clause 8 2 within",  # never join a number
+        "is due under clause 82 within the agreed period",  # nor a clause reference
+        "Interest under clause 8.2 of the Schedule accrues monthly",  # "8. 2" may be 8 and 2
+        "sign this Agreement before",  # under 25 characters: spacing is not tolerated
+    ],
+)
+def test_spacing_differences_that_could_change_the_words_are_rejected(quote: str) -> None:
+    assert not check_extracted(quote).verified
+
+
+def test_a_split_word_never_seen_whole_in_the_document_is_rejected() -> None:
+    text = "The Con tract Price is fixed for the whole term of this deal."
+    assert not check_extracted("The Contract Price is fixed for the whole term", text).verified
+    # The same split is accepted once the document uses the word unsplit elsewhere.
+    text_with_word = text + " Contract Price changes need consent."
+    check = check_extracted("The Contract Price is fixed for the whole term", text_with_word)
+    assert check.verified
+    assert check.matched_text == "The Con tract Price is fixed for the whole term"
+
+
+def test_a_split_into_two_words_both_used_elsewhere_is_rejected() -> None:
+    text = "Both parties sign the over seas annex today. Overseas sales and over and seas apply."
+    assert not check_extracted("Both parties sign the overseas annex today", text).verified
+
+
+def test_too_many_split_words_are_rejected() -> None:
+    text = (
+        "The Con tract Price and the Deli very Date and the Pay ment Terms are agreed. "
+        "Contract, Delivery and Payment are defined terms."
+    )
+    two = check_extracted("The Contract Price and the Delivery Date and the Pay ment", text)
+    assert two.verified
+    three = check_extracted("The Contract Price and the Delivery Date and the Payment Terms", text)
+    assert not three.verified
+
+
+def test_exact_match_anywhere_beats_a_spacing_match_in_the_cited_passage() -> None:
+    passage = "1. Each party shall sign this Agree ment before the Effective Date."
+    text = passage + " 2. Each party shall sign this Agreement before the Effective Date."
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, passage)}
+    check = verify_quote(
+        "Each party shall sign this Agreement before the Effective Date",
+        "E1",
+        evidence,
+        {DOC_A: SourceDocument(DOC_A, text)},
+    )
+    assert check.verified and check.match_type == "exact"
+    assert check.evidence_id is None and check.tier == "document"
+    assert check.char_start == text.index("Each party shall sign this Agreement")
+
+
+def test_spacing_matches_keep_tiers_counts_and_ambiguity() -> None:
+    sentence = "The Supplier's liability under this Agreement , is capped."
+    passage = f"1. {sentence}"
+    text = passage + f" 2. Unrelated. 3. {sentence} 4. {sentence}"
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, passage)}
+    documents = {DOC_A: SourceDocument(DOC_A, text)}
+    quote = "The Supplier's liability under this Agreement, is capped"
+    cited = verify_quote(quote, "E1", evidence, documents)
+    assert cited.verified and cited.match_type == "spacing" and cited.tier == "cited"
+    assert cited.occurrences == 3 and not cited.ambiguous
+    elsewhere = {"E1": EvidenceText("E1", DOC_A, 0, "1. The")}
+    outside = verify_quote(quote, "E1", elsewhere, documents)
+    assert outside.tier == "document" and outside.ambiguous and outside.tier_occurrences == 3
+
+
+def test_line_hyphen_and_spacing_matches_stay_in_their_own_document() -> None:
+    # Document B has the exact text; document A only a split form that is not plausible
+    # (it never uses "Agreement" unsplit). Cited from A: never verified via B.
+    text_a = "Each party shall sign this Agree ment before the Effective Date."
+    text_b = "Each party shall sign this Agreement before the Effective Date."
+    evidence = {
+        "E1": EvidenceText("E1", DOC_A, 0, text_a),
+        "E2": EvidenceText("E2", DOC_B, 0, text_b),
+    }
+    documents = {DOC_A: SourceDocument(DOC_A, text_a), DOC_B: SourceDocument(DOC_B, text_b)}
+    quote = "Each party shall sign this Agreement before the Effective Date"
+    assert not verify_quote(quote, "E1", evidence, documents).verified
+    from_b = verify_quote(quote, "E2", evidence, documents)
+    assert from_b.verified and from_b.evidence_id == "E2" and from_b.match_type == "exact"
+
+
+def test_spacing_reason_is_reported() -> None:
+    check = QuoteCheck(True, evidence_id="E1", tier="cited", tier_occurrences=1)
+    spaced = QuoteCheck(
+        True, evidence_id="E1", tier="cited", tier_occurrences=1, match_type="spacing"
+    )
+    assert _location_reason(check, "E1", "a.pdf") is None
+    assert "spacing differences" in (_location_reason(spaced, "E1", "a.pdf") or "")

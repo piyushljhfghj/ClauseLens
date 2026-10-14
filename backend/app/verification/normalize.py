@@ -36,7 +36,10 @@ class Normalized:
         return self.offsets[start], self.offsets[end - 1] + 1
 
 
-def normalize(text: str) -> Normalized:
+def normalize(text: str, *, keep_line_hyphens: bool = False) -> Normalized:
+    r"""Normalise `text`. With `keep_line_hyphens`, a hyphen at a line break is kept and only the
+    break is dropped ("non-\ncompete" -> "non-compete") instead of joining the parts
+    ("noncompete"): extraction cannot tell a real compound hyphen from word hyphenation."""
     # 1. Character-level mapping (NFKC can expand one character into several).
     chars: list[tuple[str, int]] = []
     for index, ch in enumerate(text):
@@ -59,6 +62,8 @@ def normalize(text: str) -> Normalized:
                 newline = newline or chars[j][0] in "\n\r"
                 j += 1
             if newline and j < len(chars) and chars[j][0].isalpha():
+                if keep_line_hyphens:
+                    result.append((ch, index))  # keep the hyphen, drop only the line break
                 i = j  # drop the hyphen and the line break; continue with the next word part
                 continue
         if ch.isspace():

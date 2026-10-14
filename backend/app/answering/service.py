@@ -300,6 +300,12 @@ def _location_reason(check: QuoteCheck, cited_evidence_id: str, filename: str) -
     else:
         reason = None
         where = f"in {cited_evidence_id}"
+    if check.match_type == "spacing":
+        spacing = (
+            "It matched only after allowing for spacing differences in the extracted text; the "
+            "document's own text is shown."
+        )
+        reason = f"{reason} {spacing}" if reason else spacing
     if check.ambiguous:
         repeat = (
             f"It occurs {check.tier_occurrences} times {where}; the location shown is the first, "

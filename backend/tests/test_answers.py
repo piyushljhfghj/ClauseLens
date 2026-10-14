@@ -697,3 +697,64 @@ async def test_unverified_citation_has_no_occurrence_data(
     citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
     assert citation["status"] == "unverified"
     assert citation["occurrence_count"] is None and citation["location_ambiguous"] is False
+
+
+# --- extraction differences (Phase 6, task 3) -----------------------------------------------------
+
+NON_COMPETE_PAGES = [
+    "1. Definitions. Agreement means this services agreement.",
+    "9. Restrictions\n\n9.1 The Supplier accepts a non-\ncompete restriction for twelve months "
+    "after termination of this Agreement.",
+]
+
+
+async def test_line_break_hyphen_quote_is_verified_end_to_end(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    document = await upload(api, answer_app, "restrictions.pdf", contract_pdf(NON_COMPETE_PAGES))
+    text = await canonical(document)
+    assert "non-\ncompete" in text  # the extraction keeps the line break after the hyphen
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "restriction for twelve months")
+        quote = "The Supplier accepts a non-compete restriction for twelve months"
+        return answer_output(
+            "A twelve-month non-compete applies [1].", [{"n": 1, "evidence": e, "quote": quote}]
+        )
+
+    llm.script = script
+    citation = (await ask(api, "Is there a non-compete restriction on the Supplier?", document))[
+        "citations"
+    ][0]
+    assert citation["status"] == "verified" and citation["reason"] is None
+    assert citation["quote"] == "The Supplier accepts a non-\ncompete restriction for twelve months"
+    assert text[citation["char_start"] : citation["char_end"]] == citation["quote"]
+    assert citation["page_start"] == citation["page_end"] == 2
+
+
+async def test_split_word_quote_is_verified_and_flagged_end_to_end(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    paragraphs = [
+        "1. This Agreement is made between the parties named below.",
+        "2. Each party shall sign this Agree ment before the Effective Date of the services.",
+    ]
+    document = await upload(api, answer_app, "signing.docx", factory.docx_file(paragraphs))
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Effective Date")
+        quote = "Each party shall sign this Agreement before the Effective Date"
+        return answer_output(
+            "Both sign before the Effective Date [1].", [{"n": 1, "evidence": e, "quote": quote}]
+        )
+
+    llm.script = script
+    citation = (await ask(api, "When must each party sign the Agreement?", document))["citations"][
+        0
+    ]
+    assert citation["status"] == "verified"
+    assert citation["quote"] == "Each party shall sign this Agree ment before the Effective Date"
+    assert "spacing differences" in citation["reason"]
+    text = await canonical(document)
+    assert text[citation["char_start"] : citation["char_end"]] == citation["quote"]
+    assert citation["quality"]["level"] == "not_applicable"  # DOCX: no pages
