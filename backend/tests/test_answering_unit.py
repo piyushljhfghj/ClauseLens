@@ -16,7 +16,7 @@ from app.answering.integrity import (
 )
 from app.answering.parser import parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
-from app.answering.service import _grounding, _page_at, _quote_quality
+from app.answering.service import PageRecord, _grounding, _page_at, _quote_quality
 from app.core.config import Settings
 from app.llm import (
     ChatMessage,
@@ -28,7 +28,7 @@ from app.llm import (
 from app.schemas.answers import CitationOut
 from app.schemas.retrieval import PassageQuality, RetrievalSignals, RetrievedPassage
 from app.verification.normalize import normalize
-from app.verification.quotes import EvidenceText, verify_quote
+from app.verification.quotes import EvidenceText, QuoteCheck, SourceDocument, verify_quote
 from tests.fakes import answer_output
 
 DOC_A, DOC_B = uuid.uuid4(), uuid.uuid4()
@@ -62,8 +62,32 @@ EVIDENCE = {
 }
 
 
+def documents_for(
+    evidence: dict[str, EvidenceText], extra: dict[uuid.UUID, str] | None = None
+) -> dict[uuid.UUID, SourceDocument]:
+    """Full canonical texts with each passage at its own offset (blank filler between), plus
+    optional text appended after the passages (outside every evidence passage)."""
+    texts: dict[uuid.UUID, str] = {}
+    for e in sorted(evidence.values(), key=lambda e: (str(e.document_id), e.char_start)):
+        text = texts.get(e.document_id, "")
+        assert len(text) <= e.char_start, "passages overlap"
+        texts[e.document_id] = text + " " * (e.char_start - len(text)) + e.text
+    for document_id, tail in (extra or {}).items():
+        texts[document_id] = texts.get(document_id, "") + tail
+    return {d: SourceDocument(d, t) for d, t in texts.items()}
+
+
+def verify(
+    quote: str,
+    cited: str,
+    evidence: dict[str, EvidenceText] = EVIDENCE,
+    extra: dict[uuid.UUID, str] | None = None,
+) -> QuoteCheck:
+    return verify_quote(quote, cited, evidence, documents_for(evidence, extra))
+
+
 def test_exact_quote_is_verified_with_canonical_location() -> None:
-    check = verify_quote("Either party may terminate this Agreement", "E1", EVIDENCE)
+    check = verify("Either party may terminate this Agreement", "E1", EVIDENCE)
     assert check.verified and check.evidence_id == "E1"
     assert (check.char_start, check.char_end) == (
         504,
@@ -74,7 +98,7 @@ def test_exact_quote_is_verified_with_canonical_location() -> None:
 
 def test_whitespace_case_and_quote_style_differences_are_tolerated() -> None:
     quote = f"{LDQUO}giving THIRTY (30) days' written notice{RDQUO}"
-    check = verify_quote(quote, "E1", EVIDENCE)
+    check = verify(quote, "E1", EVIDENCE)
     assert check.verified
     # The canonical text is returned, with its own apostrophe and line break, not the model's.
     assert check.matched_text == f"giving thirty (30) days{RSQUO} written\nnotice"
@@ -82,7 +106,7 @@ def test_whitespace_case_and_quote_style_differences_are_tolerated() -> None:
 
 def test_quote_across_a_line_break_hyphenation() -> None:
     evidence = {"E1": EvidenceText("E1", DOC_A, 0, "The Supplier may termi-\nnate on notice.")}
-    check = verify_quote("The Supplier may terminate on notice", "E1", evidence)
+    check = verify("The Supplier may terminate on notice", "E1", evidence)
     assert check.verified and check.matched_text == "The Supplier may termi-\nnate on notice"
 
 
@@ -96,31 +120,31 @@ def test_quote_across_a_line_break_hyphenation() -> None:
     ],
 )
 def test_unverifiable_quotes(quote: str, reason: str) -> None:
-    check = verify_quote(quote, "E1", EVIDENCE)
+    check = verify(quote, "E1", EVIDENCE)
     assert not check.verified and reason in (check.reason or "")
 
 
 def test_leading_and_trailing_ellipses_are_allowed() -> None:
-    assert verify_quote("...may terminate this Agreement...", "E1", EVIDENCE).verified
+    assert verify("...may terminate this Agreement...", "E1", EVIDENCE).verified
 
 
 def test_wrong_evidence_label_within_the_same_document_is_corrected() -> None:
-    check = verify_quote("Liability is capped at AED 100,000", "E1", EVIDENCE)
+    check = verify("Liability is capped at AED 100,000", "E1", EVIDENCE)
     assert check.verified and check.evidence_id == "E2" and check.char_start == 2005
 
 
 def test_never_verified_against_another_document() -> None:
     # Cited E2 (document A); the text exists only in E3 (document B).
-    check = verify_quote("Liability is capped at AED 1,000,000", "E2", EVIDENCE)
+    check = verify("Liability is capped at AED 1,000,000", "E2", EVIDENCE)
     assert not check.verified
 
 
 def test_unknown_evidence_id() -> None:
-    assert "not provided" in (verify_quote("Either party may", "E9", EVIDENCE).reason or "")
+    assert "not provided" in (verify("Either party may", "E9", EVIDENCE).reason or "")
 
 
 def test_duplicate_occurrences_are_counted_first_one_located() -> None:
-    check = verify_quote("Notice must be given in writing.", "E1", EVIDENCE)
+    check = verify("Notice must be given in writing.", "E1", EVIDENCE)
     assert check.verified and check.occurrences == 2
     assert (
         SOURCE[check.char_start - 500 : check.char_end - 500] == "Notice must be given in writing."
@@ -281,17 +305,26 @@ def test_grounding(markers: list[int], citations: list[CitationOut], expected: s
 
 
 def test_page_lookup_uses_stored_ranges() -> None:
-    ranges = [(0, 100, 1), (102, 250, 2), (252, 252, 3), (252, 400, 4)]
-    assert [_page_at(ranges, p) for p in (0, 99, 101, 102, 300)] == [1, 1, None, 2, 4]
+    records = [
+        PageRecord(start, end, page, "text", None, None)
+        for start, end, page in [(0, 100, 1), (102, 250, 2), (252, 252, 3), (252, 400, 4)]
+    ]
+    assert [_page_at(records, p) for p in (0, 99, 101, 102, 300)] == [1, 1, None, 2, 4]
     assert _page_at([], 5) is None
 
 
 def test_quote_quality_is_limited_to_the_quotes_pages() -> None:
-    passage_quality = PassageQuality(
-        level="low_quality_ocr", ocr_pages=[3, 4], low_quality_pages=[4], min_ocr_confidence=0.3
-    )
-    assert _quote_quality(passage_quality, 3, 3).level == "ocr"
-    assert _quote_quality(passage_quality, 4, 4).level == "low_quality_ocr"
+    records = [
+        PageRecord(0, 100, 3, "ocr", None, 0.8),
+        PageRecord(102, 200, 4, "ocr", "ocr_low_quality", 0.3),
+        PageRecord(202, 300, 5, "text", None, None),
+    ]
+    three = _quote_quality(records, 3, 3)
+    assert three.level == "ocr" and three.min_ocr_confidence == 0.8
+    assert _quote_quality(records, 4, 4).level == "low_quality_ocr"
+    assert _quote_quality(records, 5, 5).level == "text"
+    assert _quote_quality(records, 3, 5).low_quality_pages == [4]
+    assert _quote_quality(records, None, None).level == "not_applicable"  # DOCX
 
 
 # --- prompt --------------------------------------------------------------------------------------
@@ -513,12 +546,12 @@ def test_complete_output_is_not_truncated() -> None:
 def test_quoted_title_offsets_include_the_sources_own_quotation_marks() -> None:
     evidence = {"E1": EvidenceText("E1", DOC_A, 1000, BOOK)}
     quote = f"{TITLE} by Dr. A.P.J. Abdul Kalam has inspired me the most."
-    check = verify_quote(quote, "E1", evidence)
+    check = verify(quote, "E1", evidence)
     assert check.verified and check.matched_text == quote
     assert check.char_start is not None and check.char_end is not None
     assert BOOK[check.char_start - 1000 : check.char_end - 1000] == quote
     # The same quote with straight quotes (normalisation only) maps to the same canonical range.
-    straight = verify_quote(quote.replace(LDQUO, '"').replace(RDQUO, '"'), "E1", evidence)
+    straight = verify(quote.replace(LDQUO, '"').replace(RDQUO, '"'), "E1", evidence)
     assert (straight.char_start, straight.char_end, straight.matched_text) == (
         check.char_start,
         check.char_end,
@@ -528,7 +561,7 @@ def test_quoted_title_offsets_include_the_sources_own_quotation_marks() -> None:
 
 def test_wrapping_quotes_added_by_the_model_are_still_stripped() -> None:
     evidence = {"E1": EvidenceText("E1", DOC_A, 0, BOOK)}
-    check = verify_quote(f"{LDQUO}It shows how persistence, discipline{RDQUO}", "E1", evidence)
+    check = verify(f"{LDQUO}It shows how persistence, discipline{RDQUO}", "E1", evidence)
     assert check.verified and check.matched_text == "It shows how persistence, discipline"
 
 
@@ -538,7 +571,7 @@ def test_mojibake_quote_is_not_verified() -> None:
         f"{A_CIRC}Wings of Fire{A_CIRC}",
         f"{A_CIRC}{EURO}{chr(0x153)}Wings of Fire{A_CIRC}{EURO} by Dr. A.P.J. Abdul Kalam",
     ):
-        assert not verify_quote(quote, "E1", evidence).verified
+        assert not verify(quote, "E1", evidence).verified
 
 
 def test_uncited_statement_prevents_grounded() -> None:
@@ -591,3 +624,132 @@ async def test_provider_errors_never_expose_the_api_key(caplog: pytest.LogCaptur
     logged = " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
     assert "LLM request failed" in logged and "[REDACTED]" in logged
     assert secret not in logged
+
+
+# --- whole-document matching and word boundaries (Phase 6, task 1) -----------------------------
+
+OUTSIDE = (
+    "\n\n14.3 The Supplier shall maintain insurance cover of AED 5,000,000 at all times.\n\n"
+    "15. The Supplier" + RSQUO + "s liability for data loss is unlimited. Any non-compete "
+    "clause lasts 12 months. Liability"
+    + chr(0x2014)
+    + "subject to clause 9"
+    + chr(0x2014)
+    + "is several. The Supplier may termi-\nnate on notice. Notice must be given in writing."
+)
+
+
+def test_quote_outside_the_evidence_is_found_in_the_cited_document() -> None:
+    quote = "The Supplier shall maintain insurance cover of AED 5,000,000"
+    documents = documents_for(EVIDENCE, {DOC_A: OUTSIDE})
+    check = verify_quote(quote, "E1", EVIDENCE, documents)
+    assert check.verified
+    assert check.evidence_id is None  # not presented as coming from the model's evidence
+    text = documents[DOC_A].text
+    assert check.char_start == text.index(quote) and check.matched_text == quote
+    assert text[check.char_start : check.char_end] == quote
+
+
+def test_outside_match_keeps_exact_offsets_through_normalisation() -> None:
+    # Straight apostrophe and extra spaces in the quote; the document has a curly apostrophe.
+    check = verify("The Supplier's   liability for data loss", "E1", extra={DOC_A: OUTSIDE})
+    text = documents_for(EVIDENCE, {DOC_A: OUTSIDE})[DOC_A].text
+    expected = f"The Supplier{RSQUO}s liability for data loss"
+    assert check.verified and check.matched_text == expected
+    assert (check.char_start, check.char_end) == (
+        text.index(expected),
+        text.index(expected) + len(expected),
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "s liability for data loss",  # inside "Supplier's" (curly apostrophe in the source)
+        "'s liability for data loss",
+        "iability is capped at AED 100,000",  # starts inside "Liability" (passage E2)
+        "upplier shall maintain insurance",  # starts mid-word
+        "The Supplier shall maint",  # ends mid-word
+        "insurance cover of AED 5",  # ends inside "5,000,000"
+        "compete clause lasts 12 months",  # inside the hyphenated "non-compete"
+        "nate on notice. Notice must",  # inside "termi-\nnate" (line-break hyphenation)
+        "12.1 Liability is capped at AED 100",  # E2 continues ",000"
+    ],
+)
+def test_matches_inside_a_word_are_rejected(quote: str) -> None:
+    check = verify(quote, "E1", extra={DOC_A: OUTSIDE})
+    assert not check.verified and "middle of a word" in (check.reason or "")
+
+
+@pytest.mark.parametrize(
+    ("quote", "expected"),
+    [
+        ("subject to clause 9", "subject to clause 9"),  # em dashes separate words
+        ("Any non-compete clause", "Any non-compete clause"),
+        ("The Supplier may terminate on notice", "The Supplier may termi-\nnate on notice"),
+        ("(30) days" + RSQUO + " written", "(30) days" + RSQUO + " written"),  # starts at "("
+        ("8.2 Either party may", "8.2 Either party may"),  # starts at the text's first word
+    ],
+)
+def test_whole_word_matches_at_punctuation_and_dashes_are_accepted(
+    quote: str, expected: str
+) -> None:
+    check = verify(quote, "E1", extra={DOC_A: OUTSIDE})
+    assert check.verified and check.matched_text == expected
+
+
+def test_a_whole_word_occurrence_is_used_when_another_is_inside_a_word() -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, "The recap applies. Then the cap applies.")}
+    check = verify("cap applies", "E1", evidence)
+    assert check.verified and check.occurrences == 1
+    assert evidence["E1"].text[check.char_start : check.char_end] == "cap applies"
+    assert check.char_start == evidence["E1"].text.index("the cap") + 4
+
+
+def test_occurrence_in_the_cited_passage_beats_an_earlier_one_elsewhere() -> None:
+    sentence = "Notice must be given in writing."
+    evidence = {"E1": EvidenceText("E1", DOC_A, 200, f"Clause 9. {sentence}")}
+    text = f"Recital. {sentence}".ljust(200) + f"Clause 9. {sentence}"
+    documents = {DOC_A: SourceDocument(DOC_A, text)}
+    check = verify_quote(sentence, "E1", evidence, documents)
+    assert check.verified and check.evidence_id == "E1" and check.occurrences == 2
+    assert check.char_start == 200 + len("Clause 9. ")
+
+
+def test_another_passage_of_the_same_document_beats_text_outside_the_evidence() -> None:
+    check = verify("Liability is capped at AED 100,000", "E1", extra={DOC_A: OUTSIDE})
+    assert check.verified and check.evidence_id == "E2" and check.char_start == 2005
+
+
+def test_repeated_text_outside_the_evidence_uses_the_first_occurrence() -> None:
+    tail = "\n\nA. Payment is due within 45 days.\n\nB. Payment is due within 45 days."
+    check = verify("Payment is due within 45 days", "E1", extra={DOC_A: tail})
+    text = documents_for(EVIDENCE, {DOC_A: tail})[DOC_A].text
+    assert check.verified and check.evidence_id is None and check.occurrences == 2
+    assert check.char_start == text.index("Payment is due")
+
+
+def test_text_only_in_another_selected_document_is_never_a_substitute() -> None:
+    # Present in document B (as evidence and elsewhere in its text), cited from document A.
+    extra = {DOC_B: "\n\nB-only clause: the governing law is England."}
+    for quote in ("Liability is capped at AED 1,000,000", "the governing law is England"):
+        check = verify(quote, "E1", extra=extra)
+        assert not check.verified and "not found in the cited document" in (check.reason or "")
+
+
+def test_missing_document_text_is_never_verified() -> None:
+    check = verify_quote("Either party may terminate", "E1", EVIDENCE, documents={})
+    assert not check.verified and "not available" in (check.reason or "")
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "The Supplier shall maintain insurance cover of AED 50,000,000",  # changed amount
+        "Either party may terminate this Agreement immediately",  # added word
+        "The Customer shall maintain insurance cover",  # changed party
+    ],
+)
+def test_fabricated_quotes_are_not_verified_anywhere_in_the_document(quote: str) -> None:
+    check = verify(quote, "E1", extra={DOC_A: OUTSIDE})
+    assert not check.verified

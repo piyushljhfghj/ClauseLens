@@ -596,3 +596,54 @@ async def test_provider_error_response_never_contains_the_api_key(
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "LLM_UNAVAILABLE"
     assert secret not in response.text
+
+
+# --- whole-document verification (Phase 6, task 1) ------------------------------------------------
+
+GOVERNING_LAW = "This Agreement is governed by the laws of the United Arab Emirates."
+
+
+async def test_quote_outside_the_evidence_is_verified_in_its_own_document(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        evidence = evidence_in(messages)
+        assert not any("United Arab Emirates" in text for text in evidence.values())
+        e = find(evidence, "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1]. The governing law is that of the UAE [2].",
+            [
+                {"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"},
+                {"n": 2, "evidence": e, "quote": GOVERNING_LAW},
+            ],
+        )
+
+    llm.script = script
+    result = await ask(api, "How can the agreement be terminated?", contract)
+    first, second = result["citations"]
+    assert first["status"] == second["status"] == "verified"
+    assert first["evidence_id"] == first["cited_evidence_id"] and first["reason"] is None
+    # Found by searching the whole document: exact location, but not attributed to the evidence.
+    text = await canonical(contract)
+    assert second["evidence_id"] is None
+    assert "outside the passages the model was given" in second["reason"]
+    assert second["quote"] == GOVERNING_LAW
+    assert text[second["char_start"] : second["char_end"]] == GOVERNING_LAW
+    assert second["page_start"] == second["page_end"] == 4
+    assert second["document_id"] == contract and second["quality"]["level"] == "text"
+
+
+async def test_partial_word_quote_is_not_verified_end_to_end(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1].",
+            [{"n": 1, "evidence": e, "quote": "ither party may terminate this Agreement"}],
+        )
+
+    llm.script = script
+    result = await ask(api, "How can the agreement be terminated?", contract)
+    assert result["grounding"] == "ungrounded" and result["answer"] == INSUFFICIENT_ANSWER
+    assert "middle of a word" in result["citations"][0]["reason"]

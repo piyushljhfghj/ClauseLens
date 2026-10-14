@@ -9,10 +9,12 @@ presented as an answer: the response states that support was insufficient and ke
 model's draft separately for transparency.
 """
 
+import asyncio
 import bisect
 import logging
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,8 +24,9 @@ from app.answering.integrity import corruption, degenerate_repetition, uncited_s
 from app.answering.parser import ProposedCitation, parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.core.config import Settings
-from app.db.models import DocumentPage
+from app.db.models import DocumentPage, DocumentText
 from app.embeddings import Embedder
+from app.ingestion.model import LOW_QUALITY_NOTE
 from app.llm import INCOMPLETE_OUTPUT, LLMClient, LLMNotConfiguredError, LLMOutputInvalidError
 from app.retrieval.service import RetrievalService
 from app.schemas.answers import (
@@ -35,7 +38,7 @@ from app.schemas.answers import (
 )
 from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
 from app.verification.normalize import normalize
-from app.verification.quotes import EvidenceText, verify_quote
+from app.verification.quotes import EvidenceText, SourceDocument, verify_quote
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +46,20 @@ MALFORMED_OUTPUT = (
     "The answering service returned a malformed answer, so it is not shown. Please try again."
 )
 
-PageRanges = dict[uuid.UUID, list[tuple[int, int, int]]]  # doc -> [(char_start, char_end, page)]
+
+@dataclass(frozen=True)
+class PageRecord:
+    """A stored page's text range and how it was read (no word boxes: those are not needed)."""
+
+    char_start: int
+    char_end: int
+    page_number: int
+    extraction: str
+    note: str | None
+    ocr_confidence: float | None
+
+
+PageRecords = dict[uuid.UUID, list[PageRecord]]  # document -> its pages, in page order
 
 
 class AnswerService:
@@ -70,7 +86,9 @@ class AnswerService:
             question, document_ids, top_k=settings.answer_candidate_top_k
         )
         selection = select_context(retrieval.passages, settings, tuple(retrieval.analysis.terms))
-        pages = await self._page_ranges(selection.selected)
+        # Verification searches the whole text of each document that evidence came from. It is
+        # read in the same snapshot as the passages, so their offsets agree.
+        sources, pages = await self._load_documents(selection.selected)
         # End the read-only snapshot now: the LLM call can take seconds and must not hold a
         # database connection. Everything verification needs is already in memory.
         await self._session.rollback()
@@ -154,7 +172,10 @@ class AnswerService:
                 **common,
             )
 
-        citations = [self._verify(c, evidence, pages) for c in parsed.citations]
+        # CPU-bound (normalising a 150-page document takes ~0.2 s): keep it off the event loop.
+        citations = await asyncio.to_thread(
+            lambda: [self._verify(c, evidence, sources, pages) for c in parsed.citations]
+        )
         grounding, grounding_notes = _grounding(
             parsed.markers, citations, uncited_statements(parsed.answer)
         )
@@ -180,35 +201,60 @@ class AnswerService:
 
     # --- helpers --------------------------------------------------------------------------------
 
-    async def _page_ranges(self, passages: list[RetrievedPassage]) -> PageRanges:
-        wanted: dict[uuid.UUID, set[int]] = defaultdict(set)
-        for p in passages:
-            if p.page_start is not None and p.page_end is not None:
-                wanted[p.document_id].update(range(p.page_start, p.page_end + 1))
-        ranges: PageRanges = {}
-        for document_id, numbers in wanted.items():
-            rows = await self._session.execute(
-                select(DocumentPage.char_start, DocumentPage.char_end, DocumentPage.page_number)
-                .where(
-                    DocumentPage.document_id == document_id,
-                    DocumentPage.page_number.in_(sorted(numbers)),
-                )
-                .order_by(DocumentPage.page_number)
+    async def _load_documents(
+        self, passages: list[RetrievedPassage]
+    ) -> tuple[dict[uuid.UUID, SourceDocument], PageRecords]:
+        """Canonical text and page records of every document the evidence comes from."""
+        document_ids = sorted({p.document_id for p in passages}, key=str)
+        if not document_ids:
+            return {}, {}
+        texts = await self._session.execute(
+            select(DocumentText.document_id, DocumentText.canonical_text).where(
+                DocumentText.document_id.in_(document_ids)
             )
-            ranges[document_id] = [(r.char_start, r.char_end, r.page_number) for r in rows]
-        return ranges
+        )
+        sources = {
+            row.document_id: SourceDocument(row.document_id, row.canonical_text) for row in texts
+        }
+        rows = await self._session.execute(
+            select(
+                DocumentPage.document_id,
+                DocumentPage.char_start,
+                DocumentPage.char_end,
+                DocumentPage.page_number,
+                DocumentPage.extraction,
+                DocumentPage.note,
+                DocumentPage.ocr_confidence,
+            )
+            .where(DocumentPage.document_id.in_(document_ids))
+            .order_by(DocumentPage.document_id, DocumentPage.page_number)
+        )
+        pages: PageRecords = defaultdict(list)
+        for row in rows:
+            pages[row.document_id].append(
+                PageRecord(
+                    row.char_start,
+                    row.char_end,
+                    row.page_number,
+                    row.extraction,
+                    row.note,
+                    row.ocr_confidence,
+                )
+            )
+        return sources, dict(pages)
 
     def _verify(
         self,
         citation: ProposedCitation,
         evidence: dict[str, RetrievedPassage],
-        pages: PageRanges,
+        sources: dict[uuid.UUID, SourceDocument],
+        pages: PageRecords,
     ) -> CitationOut:
         texts = {
             evidence_id: EvidenceText(evidence_id, p.document_id, p.char_start, p.text)
             for evidence_id, p in evidence.items()
         }
-        check = verify_quote(citation.quote, citation.evidence_id, texts)
+        check = verify_quote(citation.quote, citation.evidence_id, texts, sources)
         base = {
             "n": citation.n,
             "proposed_quote": citation.quote,
@@ -216,57 +262,62 @@ class AnswerService:
         }
         if not check.verified:
             return CitationOut(status="unverified", reason=check.reason, **base)
-        assert check.evidence_id and check.char_start is not None and check.char_end is not None
-        passage = evidence[check.evidence_id]
-        page_start = _page_at(pages.get(passage.document_id, []), check.char_start)
-        page_end = _page_at(pages.get(passage.document_id, []), check.char_end - 1)
+        assert check.char_start is not None and check.char_end is not None
+        cited = evidence[citation.evidence_id]  # a verified quote is always in its document
+        records = pages.get(cited.document_id, [])
+        page_start = _page_at(records, check.char_start)
+        page_end = _page_at(records, check.char_end - 1)
+        if check.evidence_id is None:
+            reason: str | None = (
+                f"Found elsewhere in {cited.document_filename}, outside the passages the model "
+                f"was given (it cited {citation.evidence_id})."
+            )
+        elif check.evidence_id != citation.evidence_id:
+            reason = f"Found in {check.evidence_id}, not in the cited {citation.evidence_id}."
+        else:
+            reason = None
         return CitationOut(
             status="verified",
             evidence_id=check.evidence_id,
-            document_id=passage.document_id,
-            document_filename=passage.document_filename,
+            document_id=cited.document_id,
+            document_filename=cited.document_filename,
             quote=check.matched_text,
             char_start=check.char_start,
             char_end=check.char_end,
             page_start=page_start,
             page_end=page_end,
-            quality=_quote_quality(passage.quality, page_start, page_end),
-            reason=(
-                f"Found in {check.evidence_id}, not in the cited {citation.evidence_id}."
-                if check.evidence_id != citation.evidence_id
-                else None
-            ),
+            quality=_quote_quality(records, page_start, page_end),
+            reason=reason,
             **base,
         )
 
 
-def _page_at(ranges: list[tuple[int, int, int]], position: int) -> int | None:
+def _page_at(records: list[PageRecord], position: int) -> int | None:
     """Page whose text range contains `position` (canonical offset), from stored page ranges."""
-    if not ranges:
+    if not records:
         return None
-    starts = [r[0] for r in ranges]
-    index = bisect.bisect_right(starts, position) - 1
+    index = bisect.bisect_right([r.char_start for r in records], position) - 1
     if index < 0:
         return None
-    start, end, page = ranges[index]
-    return page if start <= position < end else None
+    record = records[index]
+    return record.page_number if record.char_start <= position < record.char_end else None
 
 
 def _quote_quality(
-    passage_quality: PassageQuality, page_start: int | None, page_end: int | None
+    records: list[PageRecord], page_start: int | None, page_end: int | None
 ) -> PassageQuality:
-    """The quality of the pages the quote itself is on (a passage may span better pages)."""
+    """How the pages the quote itself is on were read (a passage may span better pages)."""
     if page_start is None or page_end is None:
-        return passage_quality
-    on = set(range(page_start, page_end + 1))
-    low = [p for p in passage_quality.low_quality_pages if p in on]
-    ocr = [p for p in passage_quality.ocr_pages if p in on]
-    level = "low_quality_ocr" if low else "ocr" if ocr else "text"
+        return PassageQuality(level="not_applicable")  # DOCX: no pages
+    own = [r for r in records if page_start <= r.page_number <= page_end]
+    ocr = [r for r in own if r.extraction == "ocr"]
+    low = [r.page_number for r in own if r.note == LOW_QUALITY_NOTE]
+    confidences = [r.ocr_confidence for r in ocr if r.ocr_confidence is not None]
     return PassageQuality(
-        level=level,
-        ocr_pages=ocr,
+        level="low_quality_ocr" if low else "ocr" if ocr else "text",
+        ocr_pages=[r.page_number for r in ocr],
         low_quality_pages=low,
-        min_ocr_confidence=passage_quality.min_ocr_confidence if ocr else None,
+        min_ocr_confidence=min(confidences) if confidences else None,
     )
 
 
