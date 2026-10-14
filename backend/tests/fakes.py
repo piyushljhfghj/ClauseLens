@@ -1,11 +1,14 @@
 """Test doubles."""
 
 import hashlib
-from collections.abc import Sequence
+import json
+import re
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
 from app.embeddings import EMBEDDING_DIMENSION, EmbedProgress
+from app.llm import ChatMessage, LLMResult
 
 
 class FakeEmbedder:
@@ -73,3 +76,35 @@ class ConceptEmbedder(FakeEmbedder):
                 vector[slot] += _WORD_WEIGHT
         norm = np.linalg.norm(vector)
         return vector / norm if norm else vector
+
+
+# --- LLM ------------------------------------------------------------------------------------------
+
+_EVIDENCE_BLOCK = re.compile(r'<evidence id="(E\d+)">\n.*?\n---\n(.*?)\n</evidence>', re.S)
+
+
+def evidence_in(messages: list[ChatMessage]) -> dict[str, str]:
+    """The evidence passages (id -> text) exactly as the model was shown them."""
+    return dict(_EVIDENCE_BLOCK.findall(messages[-1].content))
+
+
+def answer_output(answer: str, citations: list[dict]) -> str:  # type: ignore[type-arg]
+    lines = "\n".join(json.dumps(c) for c in citations)
+    return f"<answer>\n{answer}\n</answer>\n<citations>\n{lines}\n</citations>"
+
+
+class FakeLLM:
+    """Scripted LLM: `script(messages)` returns the raw model output. Records every call."""
+
+    model_name = "fake-llm"
+
+    def __init__(self, script: Callable[[list[ChatMessage]], str] | None = None) -> None:
+        self.script = script or (lambda messages: "<answer>unset</answer>")
+        self.calls: list[list[ChatMessage]] = []
+        self.on_call: Callable[[], None] | None = None
+
+    async def complete(self, messages: list[ChatMessage]) -> LLMResult:
+        self.calls.append(messages)
+        if self.on_call:
+            self.on_call()
+        return LLMResult(self.script(messages), self.model_name, {"prompt_tokens": 1})

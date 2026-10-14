@@ -76,6 +76,7 @@ citation) is a `[char_start, char_end)` range into it.
 | `GET /api/documents/{id}/outline` (section tree) · `/{id}/pages` (per-page extraction status) | 3 ✅ |
 | `GET /api/documents/{id}/layout` (word boxes / blocks for the viewer) | 7 |
 | `POST /api/retrieval/search` `{query, document_ids[], top_k?}` → ranked passages + coverage | 4 ✅ |
+| `POST /api/answers` `{question, document_ids[]}` → answer, grounding, verified citations, evidence, exclusions | 5 ✅ |
 | `POST /api/chats` · `GET /api/chats?document_id=` · `GET/DELETE /api/chats/{id}` | 8 |
 | `POST /api/chats/{id}/messages` → SSE · `POST /api/chats/{id}/messages/{mid}/stop` | 5–8 |
 | `POST /api/comparisons` · `GET /api/comparisons/{id}?type=&significance=&sort=` | 11 |
@@ -215,6 +216,37 @@ Insufficient evidence → the fixed sentence *"I couldn't find sufficient suppor
 reads only K passages and the response says so via `coverage` (pages total/indexed, passages
 read, which pages). The prompt forbids asserting absence; absence/exhaustive questions widen
 retrieval; extraction gaps are reported.
+
+**Implemented in Phase 5 ✅ (`app/answering/`, `app/verification/`, `app/llm.py`)** — non-streaming
+answering; streaming, chat history and stop are Phase 8.
+
+- *LLM*: `OpenAICompatibleClient` (openai SDK, any OpenAI-compatible base URL), temperature 0,
+  optional seed, 1 retry, timeout; provider errors become `502 LLM_UNAVAILABLE` without
+  provider details; no provider configured → `503 LLM_NOT_CONFIGURED`.
+- *Evidence selection* (`context.py`): retrieval returns 20 candidates; a passage is used only if
+  a phrase/clause matched, or semantic and BM25 agree, or semantic-only similarity ≥ max(0.60,
+  best − 0.07), or keyword-only BM25 ≥ 0.5 × the document's best **and** ≥ 2 distinct question
+  terms. Then each document's best passage first, rest by rank, within 8 passages / ~3,000
+  tokens. Exclusions are returned with reasons. If nothing qualifies the model is not called and
+  the answer is the fixed "insufficient support" sentence (`not_found`). No reranker.
+- *Prompt* (`prompt.py`): evidence fenced in `<evidence id="En">` with document, section,
+  location and extraction quality (LOW-QUALITY OCR labelled); evidence declared to be data, not
+  instructions; rules forbid outside knowledge and absence claims.
+- *Verification* (`verification/quotes.py`, Phase 5 scope): a proposed quote is verified only if
+  its normalised form (NFKC, quote/dash variants, soft hyphens, line-break hyphenation,
+  whitespace, case) occurs verbatim in the canonical text of the cited passage or another
+  passage *of the same document*; location = canonical char range via an offset map, pages from
+  stored page ranges, quality from the quote's own pages. The model's evidence label is a hint,
+  its page numbers are ignored. Elided quotes ("…"), too-short quotes and other documents are
+  rejected.
+- *Grounding*: `grounded` (all markers verified) · `partially_grounded` (some unverified or
+  unlinked, explained in notes) · `ungrounded` (none verified → the answer is replaced by the
+  insufficient-support sentence; the draft is returned separately as `unsupported_draft`) ·
+  `not_found`. Notes always state how many excerpts the answer is based on and repeat OCR
+  limitations (low-quality and unreadable pages, also when nothing matched).
+- The DB snapshot is closed before the LLM call: no connection is held while waiting.
+- Phase 6 extends verification: whole-document search, elided quotes, near-miss diagnostics,
+  highlight rectangles.
 
 ## 7. Citation verification (Phase 6) — independent of the LLM
 

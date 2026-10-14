@@ -4,7 +4,7 @@
 answers backed by quotations that the backend has located in the document text before they are
 shown, so an invented quote is never presented as genuine.
 
-> **Project status: Phase 4 of 15 (hybrid retrieval).** What exists today is listed under
+> **Project status: Phase 5 of 15 (grounded answering with verified quotations).** What exists today is listed under
 > [What works](#what-works-today). Features described in the architecture doc are planned, not
 > implemented, until they appear in that list.
 
@@ -53,7 +53,12 @@ shown, so an invented quote is never presented as genuine.
       exact "phrase" + clause-number lookup, fused with Reciprocal Rank Fusion; scoped to the
       selected document(s); deterministic; near-duplicates removed; off-topic or empty queries
       return nothing; each passage carries its exact source location and OCR quality
-- [ ] Answers with verified quotes, highlighting, chat, comparison, research agent — Phases 5–12
+- [x] **Grounded answers** (`POST /api/answers`): only strong evidence is given to the LLM (weak
+      retrieval tails are filtered; token budget; each document represented), every quotation
+      is verified against the stored canonical text before it is shown (exact character and page
+      range, OCR quality), and an answer with no verified quotation is replaced by an explicit
+      "insufficient support" statement. Works with any OpenAI-compatible provider; no reranker
+- [ ] Highlighting, streaming chat, comparison, research agent, full verification — Phases 6–12
 
 ### Known limitations (extraction)
 
@@ -120,7 +125,9 @@ Backend (`backend/.env`, see `backend/.env.example`):
 | `DB_SSL` | `true` for hosted Postgres (Supabase) |
 | `DB_STATEMENT_CACHE_SIZE` | `0` only for transaction-mode poolers (Supabase port 6543) |
 | `CORS_ORIGINS` / `CORS_ORIGIN_REGEX` | Browser origins allowed to call the API |
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | Any OpenAI-compatible provider (from Phase 5) |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | Any OpenAI-compatible provider; blank disables answering (503) |
+| `LLM_TIMEOUT_S` / `LLM_MAX_OUTPUT_TOKENS` / `LLM_TEMPERATURE` / `LLM_SEED` | Request limits; temperature 0 for repeatable answers |
+| `ANSWER_*` | Evidence selection: candidates (20), max passages (8), token budget (3000), weak-match thresholds |
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` … / `text` or `json` |
 | `MAX_UPLOAD_MB` / `MAX_PAGES` | Upload size limit (default 25 MB) and page ceiling (default 1000) |
 | `STORAGE_BACKEND` | `local` (files under `STORAGE_LOCAL_DIR`, dev) or `supabase` (production) |

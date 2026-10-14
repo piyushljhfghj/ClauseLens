@@ -159,10 +159,76 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/answers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer a question from the selected documents, with verified quotations */
+        post: operations["answer_api_answers_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AnswerRequest */
+        AnswerRequest: {
+            /**
+             * Question
+             * @description The question about the selected documents.
+             */
+            question: string;
+            /** Document Ids */
+            document_ids: string[];
+        };
+        /** AnswerResponse */
+        AnswerResponse: {
+            /** Question */
+            question: string;
+            /**
+             * Answer
+             * @description Answer text with [n] markers; see `grounding` first.
+             */
+            answer: string;
+            /**
+             * Grounding
+             * @enum {string}
+             */
+            grounding: "grounded" | "partially_grounded" | "ungrounded" | "not_found";
+            /** Citations */
+            citations: components["schemas"]["CitationOut"][];
+            /** Evidence */
+            evidence: components["schemas"]["EvidenceOut"][];
+            /**
+             * Excluded
+             * @description Retrieved passages not shown to the model, and why (e.g. weak match).
+             */
+            excluded: components["schemas"]["ExcludedPassage"][];
+            /** Coverage */
+            coverage: components["schemas"]["DocumentCoverage"][];
+            /** Notes */
+            notes: string[];
+            /**
+             * Unsupported Draft
+             * @description The model's answer when nothing in it could be verified (shown for transparency only; the `answer` field then states that support was insufficient).
+             */
+            unsupported_draft?: string | null;
+            /** Model */
+            model?: string | null;
+            /** Usage */
+            usage?: {
+                [key: string]: number;
+            };
+        };
         /** Body_upload_document_api_documents_post */
         Body_upload_document_api_documents_post: {
             /**
@@ -170,6 +236,51 @@ export interface components {
              * @description The contract (.pdf or .docx)
              */
             file: string;
+        };
+        /** CitationOut */
+        CitationOut: {
+            /**
+             * N
+             * @description Marker number used in the answer text, e.g. [1].
+             */
+            n: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "verified" | "unverified";
+            /**
+             * Proposed Quote
+             * @description What the model claimed to quote (untrusted).
+             */
+            proposed_quote: string;
+            /** Cited Evidence Id */
+            cited_evidence_id: string;
+            /** Evidence Id */
+            evidence_id?: string | null;
+            /** Document Id */
+            document_id?: string | null;
+            /** Document Filename */
+            document_filename?: string | null;
+            /**
+             * Quote
+             * @description Exact canonical text that was matched.
+             */
+            quote?: string | null;
+            /** Char Start */
+            char_start?: number | null;
+            /** Char End */
+            char_end?: number | null;
+            /** Page Start */
+            page_start?: number | null;
+            /** Page End */
+            page_end?: number | null;
+            quality?: components["schemas"]["PassageQuality"] | null;
+            /**
+             * Reason
+             * @description Why the citation is unverified.
+             */
+            reason?: string | null;
         };
         /** ComponentCheck */
         ComponentCheck: {
@@ -334,6 +445,52 @@ export interface components {
             document_id: string;
             /** Pages */
             pages: components["schemas"]["PageOut"][];
+        };
+        /**
+         * EvidenceOut
+         * @description A passage the model was given, labelled as it saw it (E1, E2, ...).
+         */
+        EvidenceOut: {
+            /** Evidence Id */
+            evidence_id: string;
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Document Filename */
+            document_filename: string;
+            /** Chunk Id */
+            chunk_id: number;
+            /** Section Path */
+            section_path: string;
+            /** Char Start */
+            char_start: number;
+            /** Char End */
+            char_end: number;
+            /** Page Start */
+            page_start: number | null;
+            /** Page End */
+            page_end: number | null;
+            /** Text */
+            text: string;
+            /** Retrieval Rank */
+            retrieval_rank: number;
+            quality: components["schemas"]["PassageQuality"];
+        };
+        /** ExcludedPassage */
+        ExcludedPassage: {
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Chunk Id */
+            chunk_id: number;
+            /** Retrieval Rank */
+            retrieval_rank: number;
+            /** Reason */
+            reason: string;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -963,6 +1120,65 @@ export interface operations {
             };
             /** @description Invalid query, too many documents or top_k too large */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    answer_api_answers_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnswerRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnswerResponse"];
+                };
+            };
+            /** @description A selected document does not exist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A selected document is not indexed with the current pipeline */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid question or document selection */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The LLM provider failed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No LLM provider is configured */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

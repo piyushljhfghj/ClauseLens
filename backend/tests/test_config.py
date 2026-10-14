@@ -35,3 +35,29 @@ def test_api_key_is_never_rendered() -> None:
     settings = make(llm_api_key="sk-very-secret")
     assert "sk-very-secret" not in repr(settings)
     assert "sk-very-secret" not in str(settings.model_dump())
+
+
+async def test_routes_use_the_settings_the_app_was_created_with() -> None:
+    """Regression: routes resolved settings from the environment, ignoring create_app(settings)."""
+    import httpx
+
+    from app.core.config import get_settings
+    from app.main import create_app
+
+    custom = make(max_upload_mb=1, app_env="test")
+    app = create_app(custom)
+    assert app.dependency_overrides[get_settings]() is custom
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/health/live")
+    assert response.status_code == 200
+
+
+def test_env_example_loads() -> None:
+    """Regression: a blank optional value in .env.example (LLM_SEED=) failed to parse, so the
+    documented starting configuration could not start the app."""
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    settings = Settings(_env_file=example)  # type: ignore[call-arg]
+    assert settings.llm_seed is None and not settings.llm_configured

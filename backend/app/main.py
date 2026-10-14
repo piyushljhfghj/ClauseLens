@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import documents, health, retrieval
+from app.api.routes import answers, documents, health, retrieval
 from app.core.config import APP_VERSION, Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
@@ -16,13 +16,19 @@ from app.db.session import dispose_engine, get_sessionmaker, init_engine
 from app.embeddings import Embedder, FastEmbedEmbedder
 from app.ingestion.ocr import tesseract_version
 from app.jobs.worker import JobWorker
+from app.llm import LLMClient, OpenAICompatibleClient
 from app.storage import build_storage
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(settings: Settings | None = None, *, embedder: Embedder | None = None) -> FastAPI:
-    """`embedder` can be injected (tests use a fast deterministic fake)."""
+def create_app(
+    settings: Settings | None = None,
+    *,
+    embedder: Embedder | None = None,
+    llm: LLMClient | None = None,
+) -> FastAPI:
+    """`embedder` and `llm` can be injected (tests use deterministic fakes)."""
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_format)
 
@@ -37,6 +43,10 @@ def create_app(settings: Settings | None = None, *, embedder: Embedder | None = 
             batch_size=settings.embedding_batch_size,
         )
         worker = JobWorker(get_sessionmaker(), storage, settings, app.state.embedder)
+        # None when no provider is configured: answering then returns 503, everything else works.
+        app.state.llm = llm or (
+            OpenAICompatibleClient(settings) if settings.llm_configured else None
+        )
         app.state.worker = worker
         if settings.worker_enabled:
             worker.start()
@@ -84,10 +94,14 @@ def create_app(settings: Settings | None = None, *, embedder: Embedder | None = 
         expose_headers=["X-Request-ID", "Content-Disposition"],
     )
 
+    # Request handlers get settings via Depends(get_settings); make that resolve to the settings
+    # this app was created with, so lifespan, middleware and routes can never disagree.
+    app.dependency_overrides[get_settings] = lambda: settings
     register_exception_handlers(app)
     app.include_router(health.router)
     app.include_router(documents.router)
     app.include_router(retrieval.router)
+    app.include_router(answers.router)
 
     @app.get("/", include_in_schema=False)
     async def root() -> dict[str, str]:

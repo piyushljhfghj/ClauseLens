@@ -99,10 +99,29 @@ class Settings(BaseSettings):
     job_stale_after_s: int = Field(default=90, ge=10)
     job_max_attempts: int = Field(default=3, ge=1)
 
-    # --- LLM (used from Phase 5; any OpenAI-compatible provider) ---------------------------
+    # --- LLM (any OpenAI-compatible provider: OpenRouter, OpenAI, DeepSeek, Groq, Ollama...) ---
     llm_base_url: str | None = None
     llm_api_key: SecretStr | None = None
     llm_model: str | None = None
+    llm_timeout_s: float = Field(default=60.0, gt=0)
+    llm_max_output_tokens: int = Field(default=900, ge=64, le=8000)
+    # 0 = as deterministic as the provider allows. A seed is sent only if set (not all providers
+    # accept it).
+    llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    llm_seed: int | None = None
+
+    # --- Answering: evidence selection --------------------------------------------------------
+    # Passages retrieved per question before filtering.
+    answer_candidate_top_k: int = Field(default=20, ge=1, le=50)
+    answer_max_passages: int = Field(default=8, ge=1, le=30)
+    # Approximate token budget for all evidence sent to the LLM (~4 characters per token).
+    answer_context_token_budget: int = Field(default=3000, ge=200, le=50000)
+    # A passage found by only one retriever is kept only if it is close to the best one:
+    # semantic-only: similarity >= max(floor, best similarity - margin);
+    # BM25-only: score >= ratio x the best BM25 score in the same document.
+    answer_min_dense_similarity: float = Field(default=0.60, ge=-1.0, le=1.0)
+    answer_dense_margin: float = Field(default=0.07, ge=0.0, le=1.0)
+    answer_bm25_relative: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @field_validator("database_url")
     @classmethod
@@ -118,6 +137,7 @@ class Settings(BaseSettings):
         "cors_origin_regex",
         "supabase_url",
         "tesseract_cmd",
+        "llm_seed",
         mode="before",
     )
     @classmethod
