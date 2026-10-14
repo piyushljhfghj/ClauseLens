@@ -10,11 +10,11 @@ import time
 import uuid
 
 from starlette.datastructures import MutableHeaders
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.errors import error_body
 from app.core.logging import request_id_var
+from app.core.responses import UTF8JSONResponse as JSONResponse
 
 logger = logging.getLogger("app.request")
 

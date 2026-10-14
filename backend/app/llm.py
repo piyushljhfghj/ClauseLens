@@ -47,6 +47,19 @@ class LLMNotConfiguredError(AppError):
     code = "LLM_NOT_CONFIGURED"
 
 
+class LLMOutputInvalidError(AppError):
+    """The model answered, but the output cannot be used: cut off, or visibly corrupted."""
+
+    status_code = 502
+    code = "LLM_OUTPUT_INVALID"
+
+
+INCOMPLETE_OUTPUT = (
+    "The answer was cut off before it was complete, so it is not shown. Please try again or ask "
+    "a narrower question."
+)
+
+
 class OpenAICompatibleClient:
     def __init__(self, settings: Settings, *, http_client: httpx.AsyncClient | None = None) -> None:
         if not settings.llm_configured:
@@ -76,13 +89,22 @@ class OpenAICompatibleClient:
                 **extra,
             )
         except openai.APIError as exc:
-            # Details (status, provider message) go to the logs only, never to the client.
-            logger.warning("LLM request failed", extra={"error": f"{type(exc).__name__}: {exc}"})
+            # Details (status, provider message) go to the logs only, never to the client; the
+            # key is masked in case a provider echoes it back in its error message.
+            logger.warning(
+                "LLM request failed", extra={"error": self._redact(f"{type(exc).__name__}: {exc}")}
+            )
             raise LLMUnavailableError(
                 "The answering service is temporarily unavailable. Please try again."
             ) from exc
         if not response.choices or response.choices[0].message.content is None:
             raise LLMUnavailableError("The answering service returned an empty response.")
+        if response.choices[0].finish_reason == "length":
+            # Stopped by the output-token limit: the answer or its citations are incomplete.
+            logger.warning(
+                "LLM output truncated", extra={"max_tokens": self._settings.llm_max_output_tokens}
+            )
+            raise LLMOutputInvalidError(INCOMPLETE_OUTPUT)
         usage = response.usage
         return LLMResult(
             text=response.choices[0].message.content,
@@ -93,3 +115,7 @@ class OpenAICompatibleClient:
                 else {}
             ),
         )
+
+    def _redact(self, text: str) -> str:
+        key = self._settings.llm_api_key.get_secret_value() if self._settings.llm_api_key else ""
+        return text.replace(key, "[REDACTED]") if key else text

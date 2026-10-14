@@ -8,15 +8,28 @@ import httpx
 import pytest
 
 from app.answering.context import select_context
+from app.answering.integrity import (
+    corruption,
+    degenerate_repetition,
+    statements,
+    uncited_statements,
+)
 from app.answering.parser import parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.answering.service import _grounding, _page_at, _quote_quality
 from app.core.config import Settings
-from app.llm import ChatMessage, LLMNotConfiguredError, LLMUnavailableError, OpenAICompatibleClient
+from app.llm import (
+    ChatMessage,
+    LLMNotConfiguredError,
+    LLMOutputInvalidError,
+    LLMUnavailableError,
+    OpenAICompatibleClient,
+)
 from app.schemas.answers import CitationOut
 from app.schemas.retrieval import PassageQuality, RetrievalSignals, RetrievedPassage
 from app.verification.normalize import normalize
 from app.verification.quotes import EvidenceText, verify_quote
+from tests.fakes import answer_output
 
 DOC_A, DOC_B = uuid.uuid4(), uuid.uuid4()
 RSQUO, LDQUO, RDQUO, FI = chr(0x2019), chr(0x201C), chr(0x201D), chr(0xFB01)
@@ -306,10 +319,11 @@ def test_prompt_fences_evidence_and_labels_quality() -> None:
 
 
 def llm_settings(**overrides: object) -> Settings:
-    return settings(
-        llm_base_url="https://llm.example/v1", llm_api_key="sk-test", llm_model="cheap-model",
-        **overrides,
-    )  # fmt: skip
+    values: dict[str, object] = {
+        "llm_base_url": "https://llm.example/v1", "llm_api_key": "sk-test",
+        "llm_model": "cheap-model",
+    }  # fmt: skip
+    return settings(**{**values, **overrides})
 
 
 def completion(text: str) -> dict:  # type: ignore[type-arg]
@@ -374,3 +388,206 @@ async def test_provider_errors_become_a_generic_error() -> None:
 def test_missing_configuration() -> None:
     with pytest.raises(LLMNotConfiguredError):
         OpenAICompatibleClient(settings())
+
+
+# --- output integrity: corruption, repetition, truncation, uncited statements -------------------
+
+A_CIRC, EURO, MDASH, ELLIPSIS = chr(0xE2), chr(0x20AC), chr(0x2014), chr(0x2026)
+NL = chr(10)
+TITLE = f"{LDQUO}Wings of Fire{RDQUO}"
+BOOK = (
+    f"My favourite book. {TITLE} by Dr. A.P.J. Abdul Kalam has inspired me the most. It shows "
+    "how persistence, discipline and a clear purpose can overcome limited resources and repeated "
+    "failures."
+)
+LEGIT_UNICODE = (
+    f"{TITLE} {MDASH} the caf{chr(0xE9)}{RSQUO}s na{chr(0xEF)}ve r{chr(0xE9)}sum{chr(0xE9)} costs "
+    f"{EURO}100 under {chr(0xA7)}4{ELLIPSIS} 10{chr(0xA0)}days, {chr(0xC0)} la carte, "
+    f"S{chr(0xE3)}o Paulo, 2{chr(0xD7)}3."
+)
+
+
+def test_legitimate_unicode_is_not_treated_as_corruption() -> None:
+    assert corruption(LEGIT_UNICODE, []) is None
+    assert degenerate_repetition(LEGIT_UNICODE, []) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # UTF-8 curly quotes decoded as cp1252 / as Latin-1 (C1 controls), and U+FFFD.
+        f"The book is {A_CIRC}{EURO}{chr(0x153)}Wings of Fire{A_CIRC}{EURO} [1].",
+        f"The book is {A_CIRC}{chr(0x80)}{chr(0x9C)}Wings of Fire{A_CIRC}{chr(0x80)} [1].",
+        f"The caf{chr(0xC3)}{chr(0xA9)} clause applies [1].",
+        f"The {chr(0xFFFD)} clause applies [1].",
+    ],
+)
+def test_mojibake_in_the_answer_is_detected(answer: str) -> None:
+    assert corruption(answer, [BOOK]) is not None
+
+
+def test_mojibake_that_is_in_the_evidence_itself_is_not_blamed_on_the_model() -> None:
+    garbled_source = f"Clause 4: caf{chr(0xC3)}{chr(0xA9)} terms."
+    assert corruption(f"It says caf{chr(0xC3)}{chr(0xA9)} terms [1].", [garbled_source]) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        f"The book that inspired the student the most is {A_CIRC}Wings of Fire{A_CIRC}Wings of "
+        f"Fire{A_CIRC}Wings of Fire{A_CIRC}",
+        "The notice period is thirty days thirty days thirty days thirty days [1].",
+    ],
+)
+def test_degenerate_repetition_is_detected(answer: str) -> None:
+    assert degenerate_repetition(answer, [BOOK]) is not None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "It is very very very important to give notice [1].",  # repeated short word
+        "Notice must be given in writing. Notice must be given in writing. [1]",  # only twice
+        "Fees: 10 10 10 10 10 10 10 10 10 10 10 10 [1].",  # no letters
+        "Signed - - - - - - - - - - - - - - - - - - [1].",
+        # A comparison table whose cells happen to be identical.
+        "| Renewal | Not specified | Not specified | Not specified |",
+    ],
+)
+def test_legitimate_repetition_is_not_flagged(answer: str) -> None:
+    assert degenerate_repetition(answer, []) is None
+
+
+def test_repetition_present_in_the_evidence_is_allowed() -> None:
+    source = "Copy: ABC Holdings Ltd ABC Holdings Ltd ABC Holdings Ltd (signature block)."
+    answer = "The block reads ABC Holdings Ltd ABC Holdings Ltd ABC Holdings Ltd [1]."
+    assert degenerate_repetition(answer, [source]) is None
+
+
+def test_statements_keep_abbreviations_and_trailing_markers_together() -> None:
+    answer = NL.join(
+        [
+            f"The book is {TITLE} by Dr. A.P.J. Abdul Kalam [1]. It teaches patience. [2]",
+            "- Key points:",
+            "- persistence matters [2]",
+        ]
+    )
+    assert statements(answer) == [
+        f"The book is {TITLE} by Dr. A.P.J. Abdul Kalam [1].",
+        "It teaches patience. [2]",
+        "- Key points:",
+        "- persistence matters [2]",
+    ]
+    assert uncited_statements(answer) == []
+
+
+def test_uncited_statements_are_found() -> None:
+    answer = "Either party may terminate [1]. The supplier also owes a break fee of AED 50,000."
+    assert uncited_statements(answer) == ["The supplier also owes a break fee of AED 50,000."]
+
+
+def test_parse_detects_output_cut_off_mid_answer() -> None:
+    parsed = parse_output(f"<answer>{NL}The book that inspired the student the most is")
+    assert parsed.truncated
+
+
+def test_parse_detects_output_cut_off_mid_citation() -> None:
+    raw = NL.join(
+        [
+            "<answer>The book is Wings of Fire [1].</answer>",
+            "<citations>",
+            '{"n": 1, "evidence": "E1", "quote": "Wings of Fire by Dr. A.P.J.',
+        ]
+    )
+    parsed = parse_output(raw)
+    assert parsed.truncated and parsed.citations == []
+
+
+def test_complete_output_is_not_truncated() -> None:
+    raw = answer_output("Answer [1].", [{"n": 1, "evidence": "E1", "quote": "a b c"}])
+    assert not parse_output(raw).truncated
+    # A missing </answer> before <citations> is a formatting slip, not truncation.
+    assert not parse_output(f"<answer>Answer [1]<citations>{NL}</citations>").truncated
+
+
+def test_quoted_title_offsets_include_the_sources_own_quotation_marks() -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 1000, BOOK)}
+    quote = f"{TITLE} by Dr. A.P.J. Abdul Kalam has inspired me the most."
+    check = verify_quote(quote, "E1", evidence)
+    assert check.verified and check.matched_text == quote
+    assert check.char_start is not None and check.char_end is not None
+    assert BOOK[check.char_start - 1000 : check.char_end - 1000] == quote
+    # The same quote with straight quotes (normalisation only) maps to the same canonical range.
+    straight = verify_quote(quote.replace(LDQUO, '"').replace(RDQUO, '"'), "E1", evidence)
+    assert (straight.char_start, straight.char_end, straight.matched_text) == (
+        check.char_start,
+        check.char_end,
+        quote,
+    )
+
+
+def test_wrapping_quotes_added_by_the_model_are_still_stripped() -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, BOOK)}
+    check = verify_quote(f"{LDQUO}It shows how persistence, discipline{RDQUO}", "E1", evidence)
+    assert check.verified and check.matched_text == "It shows how persistence, discipline"
+
+
+def test_mojibake_quote_is_not_verified() -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, BOOK)}
+    for quote in (
+        f"{A_CIRC}Wings of Fire{A_CIRC}",
+        f"{A_CIRC}{EURO}{chr(0x153)}Wings of Fire{A_CIRC}{EURO} by Dr. A.P.J. Abdul Kalam",
+    ):
+        assert not verify_quote(quote, "E1", evidence).verified
+
+
+def test_uncited_statement_prevents_grounded() -> None:
+    citations = [cit(1, True)]
+    grounding, notes = _grounding([1], citations, ["The supplier owes a break fee of AED 50,000."])
+    assert grounding == "partially_grounded"
+    assert any("no citation" in n and "break fee" in n for n in notes)
+
+
+async def test_truncated_provider_output_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = completion("<answer>The book that inspired the student the most is")
+        body["choices"][0]["finish_reason"] = "length"
+        return httpx.Response(200, json=body)
+
+    client = OpenAICompatibleClient(
+        llm_settings(), http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    with pytest.raises(LLMOutputInvalidError) as info:
+        await client.complete([ChatMessage("user", "u")])
+    assert info.value.status_code == 502 and "cut off" in info.value.message
+
+
+async def test_unicode_survives_the_client_unchanged() -> None:
+    text = f"<answer>{LEGIT_UNICODE} [1]</answer>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion(text))
+
+    client = OpenAICompatibleClient(
+        llm_settings(), http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    assert (await client.complete([ChatMessage("user", "u")])).text == text
+
+
+async def test_provider_errors_never_expose_the_api_key(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "sk-test-SECRET-123456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Some providers echo the key back in their error message.
+        return httpx.Response(401, json={"error": {"message": f"Incorrect API key: {secret}"}})
+
+    client = OpenAICompatibleClient(
+        llm_settings(llm_api_key=secret),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with caplog.at_level("DEBUG"), pytest.raises(LLMUnavailableError) as info:
+        await client.complete([ChatMessage("user", "u")])
+    assert secret not in info.value.message
+    logged = " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
+    assert "LLM request failed" in logged and "[REDACTED]" in logged
+    assert secret not in logged

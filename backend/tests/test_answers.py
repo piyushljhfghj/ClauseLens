@@ -3,11 +3,12 @@ embeddings, and a scripted LLM whose output we control (so verification is what 
 
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import SecretStr
 from sqlalchemy import update
 
 from app.answering.prompt import INSUFFICIENT_ANSWER
@@ -17,7 +18,7 @@ from app.db.session import get_engine, get_sessionmaker
 from app.ingestion import pdf_extract
 from app.ingestion.model import SourceBlock, SourceLine, SourceWord
 from app.ingestion.ocr import OcrResult
-from app.llm import ChatMessage, LLMUnavailableError
+from app.llm import ChatMessage, LLMUnavailableError, OpenAICompatibleClient
 from app.main import create_app
 from tests.conftest import truncate_all
 from tests.fakes import ConceptEmbedder, FakeLLM, answer_output, evidence_in
@@ -422,3 +423,176 @@ async def test_no_database_connection_is_held_during_the_llm_call(
     llm.script = lambda messages: f"<answer>{INSUFFICIENT_ANSWER}</answer>"
     await ask(api, "What is the liability cap?", contract)
     assert checked_out == [0]
+
+
+# --- answer integrity (regression: "Which book inspired the student the most, and why?") ---------
+
+LDQUO, RDQUO, A_CIRC, EURO = chr(0x201C), chr(0x201D), chr(0xE2), chr(0x20AC)
+TITLE = f"{LDQUO}Wings of Fire{RDQUO}"
+BOOK_QUESTION = "Which book inspired the student the most, and why?"
+QUOTE_TITLE = f"{TITLE} by Dr. A.P.J. Abdul Kalam has inspired the student the most."
+QUOTE_WHY = "It shows how persistence, discipline and a clear purpose can overcome failures."
+QUOTE_UNICODE = (
+    f"The book costs {EURO}10 at the caf{chr(0xE9)} {chr(0x2014)} a bargain{chr(0x2026)}"
+)
+
+
+@pytest.fixture
+async def essay(api: httpx.AsyncClient, answer_app: FastAPI) -> str:
+    paragraphs = [
+        "My Favourite Book",
+        f"{QUOTE_TITLE} {QUOTE_WHY} {QUOTE_UNICODE}",
+        "The student also enjoys football and music on weekends.",
+    ]
+    return await upload(api, answer_app, "essay.docx", factory.docx_file(paragraphs))
+
+
+def book_script(
+    answer: str, citations: list[tuple[int, str]]
+) -> Callable[[list[ChatMessage]], str]:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Wings of Fire")
+        return answer_output(answer, [{"n": n, "evidence": e, "quote": q} for n, q in citations])
+
+    return script
+
+
+async def test_valid_answer_with_multiple_verified_citations_and_unicode(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    answer = (
+        f"The student was most inspired by {TITLE} by Dr. A.P.J. Abdul Kalam [1]. It shows that "
+        f"persistence and discipline overcome failures [2]. It costs {EURO}10 {chr(0x2014)} a "
+        f"bargain{chr(0x2026)} [3]"
+    )
+    llm.script = book_script(answer, [(1, QUOTE_TITLE), (2, QUOTE_WHY), (3, QUOTE_UNICODE)])
+    response = await api.post(ANSWERS, json={"question": BOOK_QUESTION, "document_ids": [essay]})
+    assert response.status_code == 200
+    # Declared UTF-8, and the bytes are real UTF-8 (a client cannot mis-decode them as Latin-1).
+    assert response.headers["content-type"] == "application/json; charset=utf-8"
+    assert TITLE.encode("utf-8") in response.content
+    result = response.json()
+    assert result["grounding"] == "grounded"
+    assert result["answer"] == answer  # complete, legitimate Unicode unchanged
+    assert [c["n"] for c in result["citations"]] == [1, 2, 3]
+    text = await canonical(essay)
+    for citation, quote in zip(
+        result["citations"], (QUOTE_TITLE, QUOTE_WHY, QUOTE_UNICODE), strict=True
+    ):
+        assert citation["status"] == "verified"
+        assert citation["quote"] == quote  # including the source's own curly quotes
+        assert text[citation["char_start"] : citation["char_end"]] == quote
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        f"The book is {A_CIRC}{EURO}{chr(0x153)}Wings of Fire{A_CIRC}{EURO} by Dr. Kalam [1].",
+        f"The book that inspired the student the most is {A_CIRC}Wings of Fire{A_CIRC}Wings of "
+        f"Fire{A_CIRC}Wings of Fire{A_CIRC} [1].",
+    ],
+    ids=["mojibake", "repetition"],
+)
+async def test_corrupted_answer_is_refused_even_with_a_verified_quote(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM, answer: str
+) -> None:
+    llm.script = book_script(answer, [(1, QUOTE_TITLE)])
+    response = await api.post(ANSWERS, json={"question": BOOK_QUESTION, "document_ids": [essay]})
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["code"] == "LLM_OUTPUT_INVALID" and "Wings" not in error["message"]
+
+
+async def test_truncated_output_is_refused(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Wings of Fire")
+        full = answer_output(
+            "The book is Wings of Fire [1]. It teaches persistence and discipline [2].",
+            [
+                {"n": 1, "evidence": e, "quote": QUOTE_TITLE},
+                {"n": 2, "evidence": e, "quote": QUOTE_WHY},
+            ],
+        )
+        return full[: full.index(QUOTE_WHY) + 20]  # cut off inside the second citation
+
+    llm.script = script
+    response = await api.post(ANSWERS, json={"question": BOOK_QUESTION, "document_ids": [essay]})
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "LLM_OUTPUT_INVALID"
+    assert "cut off" in response.json()["error"]["message"]
+
+
+async def test_insufficient_reply_without_closing_tag_is_not_found_not_an_error(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    llm.script = lambda messages: f"<answer>{INSUFFICIENT_ANSWER}"
+    result = await ask(api, BOOK_QUESTION, essay)
+    assert result["grounding"] == "not_found" and result["answer"] == INSUFFICIENT_ANSWER
+
+
+async def test_non_matching_quote_is_never_verified(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    llm.script = book_script(
+        "The student was inspired by The Alchemist [1].",
+        [(1, "The Alchemist by Paulo Coelho has inspired the student the most.")],
+    )
+    result = await ask(api, BOOK_QUESTION, essay)
+    assert result["grounding"] == "ungrounded" and result["answer"] == INSUFFICIENT_ANSWER
+    assert result["citations"][0]["status"] == "unverified"
+
+
+async def test_markers_without_citations_are_not_grounded(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    llm.script = book_script(
+        f"The book is {TITLE} [1]. The student read it twelve times last year [3].",
+        [(1, QUOTE_TITLE)],
+    )
+    result = await ask(api, BOOK_QUESTION, essay)
+    assert result["grounding"] == "partially_grounded"
+    assert any("[3]" in n and "no citation" in n for n in result["notes"])
+
+
+async def test_uncited_claim_is_not_grounded(
+    api: httpx.AsyncClient, essay: str, llm: FakeLLM
+) -> None:
+    llm.script = book_script(
+        f"The book is {TITLE} [1]. The student plans to become a rocket scientist like Kalam.",
+        [(1, QUOTE_TITLE)],
+    )
+    result = await ask(api, BOOK_QUESTION, essay)
+    assert result["grounding"] == "partially_grounded"
+    assert any("no citation" in n and "rocket scientist" in n for n in result["notes"])
+
+
+async def test_provider_error_response_never_contains_the_api_key(
+    db_settings: Settings, essay: str
+) -> None:
+    secret = "sk-test-SECRET-987654"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": f"Incorrect API key: {secret}"}})
+
+    configured = db_settings.model_copy(
+        update={
+            "llm_base_url": "https://llm.example/v1",
+            "llm_api_key": SecretStr(secret),
+            "llm_model": "cheap-model",
+        }
+    )
+    client = OpenAICompatibleClient(
+        configured, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    app = create_app(configured, embedder=ConceptEmbedder(), llm=client)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api_client:
+            response = await api_client.post(
+                ANSWERS, json={"question": BOOK_QUESTION, "document_ids": [essay]}
+            )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "LLM_UNAVAILABLE"
+    assert secret not in response.text

@@ -14,10 +14,10 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import request_id_var
+from app.core.responses import UTF8JSONResponse as JSONResponse
 
 logger = logging.getLogger(__name__)
 

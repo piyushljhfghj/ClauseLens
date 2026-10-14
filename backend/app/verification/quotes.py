@@ -71,7 +71,10 @@ def verify_quote(
     text, problem = clean_quote(quote)
     if problem:
         return QuoteCheck(False, problem)
-    needle = normalize(text).text
+    # Quotation marks at the edges may be the model's wrapping or part of the source text
+    # (a quoted title). Try the quote with them first, so a match covers the source's own marks
+    # and its offsets are exact, then without them.
+    needles = list(dict.fromkeys([normalize(quote.strip()).text, normalize(text).text]))
 
     # The cited passage first, then the other passages of the SAME document (the model may cite
     # the wrong label). Never another document: each quote is verified against its own document.
@@ -80,17 +83,18 @@ def verify_quote(
     ]
     for passage in candidates:
         normalised = normalize(passage.text)
-        hits = _find_all(normalised.text, needle)
-        if hits:
-            start, end = normalised.original_span(hits[0], hits[0] + len(needle))
-            return QuoteCheck(
-                True,
-                evidence_id=passage.evidence_id,
-                char_start=passage.char_start + start,
-                char_end=passage.char_start + end,
-                matched_text=passage.text[start:end],
-                occurrences=len(hits),
-            )
+        for needle in needles:
+            hits = _find_all(normalised.text, needle)
+            if hits:
+                start, end = normalised.original_span(hits[0], hits[0] + len(needle))
+                return QuoteCheck(
+                    True,
+                    evidence_id=passage.evidence_id,
+                    char_start=passage.char_start + start,
+                    char_end=passage.char_start + end,
+                    matched_text=passage.text[start:end],
+                    occurrences=len(hits),
+                )
     return QuoteCheck(
         False, "The quoted text was not found in the cited document's evidence passages."
     )

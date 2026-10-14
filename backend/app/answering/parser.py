@@ -28,6 +28,7 @@ class ParsedOutput:
     answer: str
     citations: list[ProposedCitation] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    truncated: bool = False  # the output stops mid-answer or mid-citation
 
     @property
     def markers(self) -> list[int]:
@@ -44,19 +45,24 @@ def parse_output(raw: str) -> ParsedOutput:
         problems.append("The model did not use the <answer> format.")
         answer = re.split(r"<citations>", text, flags=re.I)[0].strip()
 
+    # Cut off inside the answer: it opened and nothing that ends it follows.
+    truncated = bool(answer_match) and not re.search(r"</answer>|<citations>", text, re.I)
+
     citations: list[ProposedCitation] = []
     block = _CITATIONS.search(text)
     if block:
         body = _FENCE.sub("", block.group(1))
+        closed = re.search(r"</citations>", text, re.I) is not None
+        lines = [line.strip().rstrip(",") for line in body.splitlines() if line.strip()]
         seen: set[int] = set()
-        for line in body.splitlines():
-            line = line.strip().rstrip(",")
-            if not line:
-                continue
+        for index, line in enumerate(lines):
             try:
                 item = json.loads(line)
                 n, evidence_id, quote = int(item["n"]), str(item["evidence"]), str(item["quote"])
             except (ValueError, KeyError, TypeError):
+                if not closed and index == len(lines) - 1 and line.startswith("{"):
+                    # An unfinished last JSON object with no closing tag: the output was cut off.
+                    truncated = True
                 problems.append(f"Ignored a malformed citation line: {line[:80]}")
                 continue
             if not _EVIDENCE_ID.match(evidence_id) or not quote.strip():
@@ -67,4 +73,4 @@ def parse_output(raw: str) -> ParsedOutput:
                 continue
             seen.add(n)
             citations.append(ProposedCitation(n, evidence_id, quote))
-    return ParsedOutput(answer=answer, citations=citations, problems=problems)
+    return ParsedOutput(answer=answer, citations=citations, problems=problems, truncated=truncated)

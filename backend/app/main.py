@@ -12,6 +12,7 @@ from app.core.config import APP_VERSION, Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware, UploadSizeLimitMiddleware
+from app.core.responses import UTF8JSONResponse
 from app.db.session import dispose_engine, get_sessionmaker, init_engine
 from app.embeddings import Embedder, FastEmbedEmbedder
 from app.ingestion.ocr import tesseract_version
@@ -79,6 +80,7 @@ def create_app(
         version=APP_VERSION,
         description="Evidence-grounded contract intelligence.",
         lifespan=lifespan,
+        default_response_class=UTF8JSONResponse,
     )
 
     # Middleware order: the last one added runs first. CORS must wrap everything (including

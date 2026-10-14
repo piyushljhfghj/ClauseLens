@@ -10,6 +10,7 @@ model's draft separately for transparency.
 """
 
 import bisect
+import logging
 import uuid
 from collections import defaultdict
 
@@ -17,12 +18,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.answering.context import select_context
+from app.answering.integrity import corruption, degenerate_repetition, uncited_statements
 from app.answering.parser import ProposedCitation, parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.core.config import Settings
 from app.db.models import DocumentPage
 from app.embeddings import Embedder
-from app.llm import LLMClient, LLMNotConfiguredError
+from app.llm import INCOMPLETE_OUTPUT, LLMClient, LLMNotConfiguredError, LLMOutputInvalidError
 from app.retrieval.service import RetrievalService
 from app.schemas.answers import (
     AnswerResponse,
@@ -34,6 +36,12 @@ from app.schemas.answers import (
 from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
 from app.verification.normalize import normalize
 from app.verification.quotes import EvidenceText, verify_quote
+
+logger = logging.getLogger(__name__)
+
+MALFORMED_OUTPUT = (
+    "The answering service returned a malformed answer, so it is not shown. Please try again."
+)
 
 PageRanges = dict[uuid.UUID, list[tuple[int, int, int]]]  # doc -> [(char_start, char_end, page)]
 
@@ -100,6 +108,9 @@ class AnswerService:
         evidence = {f"E{i}": p for i, p in enumerate(selection.selected, start=1)}
         result = await self._llm.complete(build_messages(retrieval.query, evidence))
         parsed = parse_output(result.text)
+        # The exact "insufficient" reply is complete even if its closing tag is missing.
+        truncated = parsed.truncated and not _is_insufficient(parsed.answer)
+        _check_output(parsed.answer, truncated, [p.text for p in evidence.values()])
         notes.extend(parsed.problems)
         notes.append(_reading_note(evidence, retrieval.coverage))
         if any(p.quality.level == "low_quality_ocr" for p in evidence.values()):
@@ -144,7 +155,9 @@ class AnswerService:
             )
 
         citations = [self._verify(c, evidence, pages) for c in parsed.citations]
-        grounding, grounding_notes = _grounding(parsed.markers, citations)
+        grounding, grounding_notes = _grounding(
+            parsed.markers, citations, uncited_statements(parsed.answer)
+        )
         notes.extend(grounding_notes)
         for citation in citations:
             if citation.quality and citation.quality.level == "low_quality_ocr":
@@ -261,7 +274,29 @@ def _is_insufficient(answer: str) -> bool:
     return normalize(answer).text == normalize(INSUFFICIENT_ANSWER).text
 
 
-def _grounding(markers: list[int], citations: list[CitationOut]) -> tuple[Grounding, list[str]]:
+def _check_output(answer: str, truncated: bool, evidence_texts: list[str]) -> None:
+    """Refuse model output that is incomplete or visibly corrupted: an honest error is better
+    than presenting it, even if some of its quotes verify. Only the kind of problem is logged."""
+    if truncated:
+        logger.warning("LLM output rejected", extra={"problem": "truncated"})
+        raise LLMOutputInvalidError(INCOMPLETE_OUTPUT)
+    found = corruption(answer, evidence_texts)
+    if found is not None:
+        logger.warning(
+            "LLM output rejected", extra={"problem": "mojibake", "sequence": ascii(found)}
+        )
+        raise LLMOutputInvalidError(MALFORMED_OUTPUT)
+    fragment = degenerate_repetition(answer, evidence_texts)
+    if fragment is not None:
+        logger.warning(
+            "LLM output rejected", extra={"problem": "repetition", "fragment": ascii(fragment[:60])}
+        )
+        raise LLMOutputInvalidError(MALFORMED_OUTPUT)
+
+
+def _grounding(
+    markers: list[int], citations: list[CitationOut], uncited: list[str] | None = None
+) -> tuple[Grounding, list[str]]:
     verified = {c.n for c in citations if c.status == "verified"}
     if not verified:
         return "ungrounded", [
@@ -284,6 +319,11 @@ def _grounding(markers: list[int], citations: list[CitationOut]) -> tuple[Ground
         )
     if not markers:
         notes.append("The answer does not mark which statements its quotations support.")
+    elif uncited:
+        notes.append(
+            f"{len(uncited)} statement(s) in the answer have no citation and are not supported: "
+            + " | ".join(f'"{statement[:80]}"' for statement in uncited)
+        )
     return ("grounded" if not notes else "partially_grounded"), notes
 
 
