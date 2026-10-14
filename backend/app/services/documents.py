@@ -11,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import AppError, ConflictError, NotFoundError, ServiceUnavailableError
-from app.db.models import Document
+from app.db.models import Document, DocumentPage, DocumentSection, DocumentText
 from app.ingestion.detect import detect_file_type, sanitize_filename
+from app.ingestion.pipeline import INDEX_VERSION
+from app.ingestion.structure import section_preview
 from app.jobs import queue
 from app.storage import Storage, StorageError, document_key
 
@@ -109,7 +111,7 @@ class DocumentService:
         self._on_job_enqueued()
         return document
 
-    async def list(self, *, limit: int, offset: int) -> tuple[list[Document], int]:
+    async def list_documents(self, *, limit: int, offset: int) -> tuple[list[Document], int]:
         total = (await self._session.execute(select(func.count(Document.id)))).scalar_one()
         rows = await self._session.execute(
             select(Document).order_by(Document.created_at.desc()).limit(limit).offset(offset)
@@ -143,7 +145,18 @@ class DocumentService:
         logger.info("document deleted", extra={"document_id": str(document_id)})
 
     async def reprocess(self, document_id: uuid.UUID) -> Document:
-        document = await self.get(document_id)
+        # Lock the row so concurrent requests serialise: the second one waits, then sees
+        # "queued" and is rejected, instead of both passing the check and queueing two jobs.
+        document = (
+            await self._session.execute(
+                select(Document)
+                .where(Document.id == document_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if document is None:
+            raise NotFoundError("Document not found.", code="DOCUMENT_NOT_FOUND")
         if document.status in ("queued", "processing"):
             raise ConflictError("This document is already being processed.", code="DOCUMENT_BUSY")
         document.status = "queued"
@@ -160,6 +173,54 @@ class DocumentService:
         await self._session.refresh(document)
         self._on_job_enqueued()
         return document
+
+    async def _get_indexed(self, document_id: uuid.UUID) -> Document:
+        document = await self.get(document_id)
+        if document.status != "ready" or document.index_version != INDEX_VERSION:
+            raise ConflictError(
+                "This document has not been indexed yet. Reprocess it to extract its structure.",
+                code="DOCUMENT_NOT_INDEXED",
+            )
+        return document
+
+    async def outline(self, document_id: uuid.UUID) -> list[tuple[DocumentSection, str]]:
+        """Sections in document order, each with a short preview of its opening text."""
+        await self._get_indexed(document_id)
+        rows = await self._session.execute(
+            select(DocumentSection)
+            .where(DocumentSection.document_id == document_id)
+            .order_by(DocumentSection.ordinal)
+        )
+        sections = list(rows.scalars())
+        text = (await self._session.get(DocumentText, document_id)).canonical_text  # type: ignore[union-attr]
+        return [
+            (
+                s,
+                section_preview(
+                    text[s.char_start : min(s.char_end, s.char_start + 400)],
+                    has_number=s.number is not None,
+                ),
+            )
+            for s in sections
+        ]
+
+    async def pages(self, document_id: uuid.UUID) -> list[dict[str, object]]:
+        """Per-page extraction status (without the word boxes, which are large)."""
+        await self._get_indexed(document_id)
+        rows = await self._session.execute(
+            select(
+                DocumentPage.page_number,
+                DocumentPage.width,
+                DocumentPage.height,
+                DocumentPage.extraction,
+                DocumentPage.note,
+                DocumentPage.ocr_confidence,
+                (DocumentPage.char_end - DocumentPage.char_start).label("char_count"),
+            )
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_number)
+        )
+        return [dict(row._mapping) for row in rows]
 
     async def _delete_file_quietly(self, key: str) -> None:
         try:

@@ -74,6 +74,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/documents/{document_id}/outline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Detected sections (clause tree), in document order */
+        get: operations["get_document_outline_api_documents__document_id__outline_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/documents/{document_id}/pages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** How each page was read: text layer, OCR, or not at all */
+        get: operations["get_document_pages_api_documents__document_id__pages_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/documents/{document_id}/file": {
         parameters: {
             query?: never;
@@ -126,7 +160,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "ok" | "error";
+            status: "ok" | "error" | "disabled";
             /** Latency Ms */
             latency_ms?: number | null;
             /**
@@ -191,6 +225,36 @@ export interface components {
              */
             pages_without_text: number | null;
             /**
+             * Stage Detail
+             * @description e.g. 'OCR page 3 of 40'.
+             */
+            stage_detail?: string | null;
+            /** Index Version */
+            index_version?: number | null;
+            /** Char Count */
+            char_count?: number | null;
+            /** Section Count */
+            section_count?: number | null;
+            /** Chunk Count */
+            chunk_count?: number | null;
+            /**
+             * Ocr Page Count
+             * @description Pages read with OCR.
+             */
+            ocr_page_count?: number | null;
+            /**
+             * Unreadable Page Count
+             * @description Pages that may contain text that could not be read (OCR unavailable/failed).
+             */
+            unreadable_page_count?: number | null;
+            /**
+             * Low Quality Page Count
+             * @description OCR pages read with low confidence: indexed, but possibly largely unrecognised.
+             */
+            low_quality_page_count?: number | null;
+            /** Extraction Warnings */
+            extraction_warnings?: string[];
+            /**
              * Created At
              * Format: date-time
              */
@@ -202,6 +266,36 @@ export interface components {
             updated_at: string;
             /** Processed At */
             processed_at: string | null;
+            /**
+             * Indexed
+             * @description Fully extracted, chunked and embedded with the current pipeline.
+             */
+            readonly indexed: boolean;
+            /**
+             * Needs Reprocessing
+             * @description Stored and inspected but not indexed (or indexed by an older pipeline).
+             */
+            readonly needs_reprocessing: boolean;
+        };
+        /** DocumentOutline */
+        DocumentOutline: {
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Sections */
+            sections: components["schemas"]["SectionOut"][];
+        };
+        /** DocumentPages */
+        DocumentPages: {
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Pages */
+            pages: components["schemas"]["PageOut"][];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -213,6 +307,8 @@ export interface components {
             database: components["schemas"]["ComponentCheck"];
             pgvector: components["schemas"]["ComponentCheck"];
             migrations: components["schemas"]["ComponentCheck"];
+            ocr: components["schemas"]["ComponentCheck"];
+            embeddings: components["schemas"]["ComponentCheck"];
         };
         /** HealthResponse */
         HealthResponse: {
@@ -240,6 +336,63 @@ export interface components {
              * @constant
              */
             status: "ok";
+        };
+        /** PageOut */
+        PageOut: {
+            /** Page Number */
+            page_number: number;
+            /** Width */
+            width: number;
+            /** Height */
+            height: number;
+            /**
+             * Extraction
+             * @enum {string}
+             */
+            extraction: "text" | "ocr" | "none";
+            /**
+             * Note
+             * @description Why content may be missing: blank | ocr_unavailable | ocr_failed | ocr_no_text, or ocr_low_quality (text kept, low OCR confidence).
+             */
+            note: string | null;
+            /** Ocr Confidence */
+            ocr_confidence: number | null;
+            /** Char Count */
+            char_count: number;
+        };
+        /** SectionOut */
+        SectionOut: {
+            /** Id */
+            id: number;
+            /** Parent Id */
+            parent_id: number | null;
+            /** Ordinal */
+            ordinal: number;
+            /** Level */
+            level: number;
+            /** Kind */
+            kind: string;
+            /** Number */
+            number: string | null;
+            /**
+             * Title
+             * @description Heading text, when the section has one.
+             */
+            title: string | null;
+            /**
+             * Preview
+             * @description Opening words of the section, for display when there is no title.
+             * @default
+             */
+            preview: string;
+            /** Char Start */
+            char_start: number;
+            /** Char End */
+            char_end: number;
+            /** Page Start */
+            page_start: number | null;
+            /** Page End */
+            page_end: number | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -449,6 +602,82 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_document_outline_api_documents__document_id__outline_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentOutline"];
+                };
+            };
+            /** @description Document not indexed yet */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_document_pages_api_documents__document_id__pages_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentPages"];
+                };
+            };
+            /** @description Document not indexed yet */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

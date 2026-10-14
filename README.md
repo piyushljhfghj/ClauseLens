@@ -4,7 +4,7 @@
 answers backed by quotations that the backend has located in the document text before they are
 shown, so an invented quote is never presented as genuine.
 
-> **Project status: Phase 2 of 15 (document upload & library).** What exists today is listed under
+> **Project status: Phase 3 of 15 (extraction, OCR, structure, chunking, embeddings).** What exists today is listed under
 > [What works](#what-works-today). Features described in the architecture doc are planned, not
 > implemented, until they appear in that list.
 
@@ -29,9 +29,35 @@ shown, so an invented quote is never presented as genuine.
       partly scanned PDFs are flagged ("3 of 40 pages have no selectable text")
 - [x] **Document library**: list, open (PDF shown inline; DOCX downloadable), download, delete
       (removes the database rows and the stored file), retry failed processing
-- [ ] Text extraction, OCR, structure, chunking, embeddings — Phase 3
-      (until then "Ready" means *stored and inspected*, not yet searchable)
+- [x] **Text extraction with positions**: one canonical text per document; every PDF word keeps
+      its character range and its box on the displayed page (rotation handled) for later
+      citation highlighting. Running headers/footers and page numbers are removed so sentences
+      crossing a page break stay contiguous
+- [x] **OCR** (Tesseract) for pages without a text layer, per page; each page records how it
+      was read (text layer / OCR with confidence / low-quality OCR / not read and why). A PDF
+      only fails if *no* page has readable text; pages that could not be read, and OCR pages
+      read with low confidence (< 50%, content possibly largely unrecognised), are counted and
+      reported separately, never hidden
+- [x] **DOCX extraction** including tables, tracked changes (read as accepted) and Word
+      auto-numbering ("8.2", "(a)") resolved into the text
+- [x] **Section tree** from clause numbering (8 / 8.2 / Section 12.3 / Article IV / Schedule 2)
+      and headings (DOCX heading styles; PDF font size, bold, ALL CAPS)
+- [x] **Chunks** that cover the whole text with no gaps or overlaps and never span two top-level
+      sections; **embeddings** with `BAAI/bge-small-en-v1.5` (local, fastembed/ONNX) in pgvector;
+      BM25 tokens stored for Phase 4
+- [x] **Index status in the UI**: *Indexed* vs *Not indexed* (stored and checked only, e.g. files
+      uploaded before Phase 3) with Reprocess / Reprocess all; coverage summary, per-page
+      extraction strip, warnings and detected structure on the document page
+- [x] Reprocessing replaces a document's whole index in one transaction (never half-built)
 - [ ] Chat, retrieval, verified quotes, highlighting, comparison, research agent — Phases 4–12
+
+### Known limitations (extraction)
+
+- PDF reading order follows the PDF's own text order; complex multi-column layouts may interleave.
+- DOCX text boxes, footnotes and headers/footers are not extracted.
+- OCR is English-only by default (`OCR_LANGUAGE`); low-confidence OCR pages are flagged.
+- Heading detection is heuristic: unusual numbering schemes may be missed (the text is still
+  fully indexed as passages).
 
 ## Repository layout
 
@@ -45,7 +71,9 @@ docker-compose.yml   Local PostgreSQL + pgvector (and optional API container)
 ## Run locally (Windows PowerShell)
 
 Prerequisites: [Docker Desktop](https://www.docker.com/products/docker-desktop/),
-[uv](https://docs.astral.sh/uv/), Node.js 22+. uv downloads Python 3.12 automatically.
+[uv](https://docs.astral.sh/uv/), Node.js 22+, and [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
+(for scanned PDFs; if it is not on PATH set `TESSERACT_CMD`). uv downloads Python 3.12
+automatically; the embedding model (~65 MB) downloads on first use into `backend/.cache/`.
 
 ```powershell
 # 1. Database (from the repo root)
@@ -93,6 +121,8 @@ Backend (`backend/.env`, see `backend/.env.example`):
 | `MAX_UPLOAD_MB` / `MAX_PAGES` | Upload size limit (default 25 MB) and page ceiling (default 1000) |
 | `STORAGE_BACKEND` | `local` (files under `STORAGE_LOCAL_DIR`, dev) or `supabase` (production) |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` / `SUPABASE_STORAGE_BUCKET` | Supabase Storage (private bucket; server-side key only) |
+| `OCR_ENABLED` / `OCR_LANGUAGE` / `OCR_DPI` / `TESSERACT_CMD` | OCR of scanned pages (Tesseract) |
+| `EMBEDDING_MODEL` / `EMBEDDING_CACHE_DIR` / `EMBEDDING_BATCH_SIZE` | Local embedding model (only `BAAI/bge-small-en-v1.5`, 384-dim, is supported) |
 | `WORKER_ENABLED` / `JOB_MAX_ATTEMPTS` | In-process background worker; retries for unexpected errors |
 | `RUN_MIGRATIONS_ON_START` | Container runs `alembic upgrade head` before starting (default `true` in the image) |
 

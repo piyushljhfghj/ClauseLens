@@ -6,13 +6,15 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { DocumentDetailSkeleton } from "@/components/documents/DocumentDetailSkeleton";
+import { IndexPanel } from "@/components/documents/IndexPanel";
+import { OutlinePanel } from "@/components/documents/OutlinePanel";
 import { StatusBadge } from "@/components/library/StatusBadge";
 import { useDocumentActions } from "@/components/library/useDocumentActions";
 import { buttonClass } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ApiError } from "@/lib/api/client";
 import { documentFileUrl, getDocument } from "@/lib/api/documents";
-import { describePages, formatBytes, formatDateTime, isInFlight } from "@/lib/documents";
+import { coverageSummary, describePages, formatBytes, formatDateTime, isInFlight } from "@/lib/documents";
 
 export function DocumentDetail({ id }: { id: string }) {
   const router = useRouter();
@@ -48,7 +50,7 @@ export function DocumentDetail({ id }: { id: string }) {
   }
 
   const document = query.data;
-  const pages = describePages(document);
+  const pages = (document.indexed ? coverageSummary(document) : null) ?? describePages(document);
 
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-8 sm:px-6">
@@ -69,7 +71,19 @@ export function DocumentDetail({ id }: { id: string }) {
             </div>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {document.status === "ready" ? (
+            <button
+              type="button"
+              className={buttonClass("secondary")}
+              onClick={() => actions.retry(document)}
+              disabled={actions.retryingId === document.id}
+              title="Run extraction and indexing again"
+            >
+              <RotateCcw aria-hidden className="h-4 w-4" />
+              Reprocess
+            </button>
+          ) : null}
           <a href={documentFileUrl(document.id, { download: true })} className={buttonClass("secondary")}>
             <Download aria-hidden className="h-4 w-4" />
             Download
@@ -101,17 +115,27 @@ export function DocumentDetail({ id }: { id: string }) {
         </div>
       ) : null}
 
-      {document.status === "ready" && document.pages_without_text ? (
-        <div className="mt-6 flex gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+      {document.needs_reprocessing ? (
+        <div className="mt-6 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 sm:flex-row sm:items-center dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
           <AlertTriangle aria-hidden className="h-5 w-5 shrink-0" />
-          <p>
-            {document.pages_without_text} of {document.page_count} pages have no selectable text (they look scanned).
-            Their contents can&apos;t be read from the text layer.
+          <p className="flex-1">
+            <span className="font-medium">Stored and checked, but not indexed.</span> This document was uploaded before text
+            extraction was available, so it can&apos;t be searched or cited yet.
           </p>
+          <button
+            type="button"
+            className={buttonClass("secondary")}
+            onClick={() => actions.retry(document)}
+            disabled={actions.retryingId === document.id}
+          >
+            <RotateCcw aria-hidden className="h-4 w-4" />
+            Reprocess now
+          </button>
         </div>
       ) : null}
 
-      <section aria-label="Document" className="mt-6 flex flex-1 flex-col">
+      <div className="mt-6 grid flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <section aria-label="Document" className="flex flex-col">
         {document.status !== "ready" ? (
           <div className="rounded-xl border border-dashed border-zinc-300 px-4 py-12 text-center text-sm text-zinc-500 dark:border-zinc-700">
             {isInFlight(document.status)
@@ -130,6 +154,13 @@ export function DocumentDetail({ id }: { id: string }) {
           </div>
         )}
       </section>
+      {document.indexed ? (
+        <aside className="flex flex-col gap-4">
+          <IndexPanel document={document} />
+          <OutlinePanel document={document} />
+        </aside>
+      ) : null}
+      </div>
 
       <ConfirmDialog
         open={actions.pendingDelete !== null}

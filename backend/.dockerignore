@@ -9,3 +9,5 @@
 tests/
 # Local uploaded files (STORAGE_BACKEND=local) must never be baked into the image.
 storage/
+# Local model cache (the image downloads its own copy at build time).
+.cache/

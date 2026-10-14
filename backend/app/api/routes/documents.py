@@ -8,7 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.session import get_session
-from app.schemas.documents import DocumentList, DocumentOut
+from app.schemas.documents import (
+    DocumentList,
+    DocumentOut,
+    DocumentOutline,
+    DocumentPages,
+    PageOut,
+    SectionOut,
+)
 from app.services.documents import DocumentService
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -74,13 +81,41 @@ async def list_documents(
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DocumentList:
-    items, total = await service.list(limit=limit, offset=offset)
+    items, total = await service.list_documents(limit=limit, offset=offset)
     return DocumentList(items=[DocumentOut.model_validate(d) for d in items], total=total)
 
 
 @router.get("/{document_id}", response_model=DocumentOut, summary="Get one document")
 async def get_document(document_id: uuid.UUID, service: Service) -> DocumentOut:
     return DocumentOut.model_validate(await service.get(document_id))
+
+
+@router.get(
+    "/{document_id}/outline",
+    response_model=DocumentOutline,
+    summary="Detected sections (clause tree), in document order",
+    responses={409: {"description": "Document not indexed yet"}},
+)
+async def get_document_outline(document_id: uuid.UUID, service: Service) -> DocumentOutline:
+    sections = await service.outline(document_id)
+    return DocumentOutline(
+        document_id=document_id,
+        sections=[
+            SectionOut.model_validate(section).model_copy(update={"preview": preview})
+            for section, preview in sections
+        ],
+    )
+
+
+@router.get(
+    "/{document_id}/pages",
+    response_model=DocumentPages,
+    summary="How each page was read: text layer, OCR, or not at all",
+    responses={409: {"description": "Document not indexed yet"}},
+)
+async def get_document_pages(document_id: uuid.UUID, service: Service) -> DocumentPages:
+    pages = await service.pages(document_id)
+    return DocumentPages(document_id=document_id, pages=[PageOut(**p) for p in pages])
 
 
 @router.get(

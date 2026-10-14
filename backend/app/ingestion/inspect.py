@@ -1,4 +1,5 @@
-"""Document inspection: open the file, count pages, and find out whether it has usable text.
+"""Document inspection: validate that the file can be processed (opens, not password-protected,
+not empty, within the page limit) and count pages without a text layer.
 
 Runs in a worker thread (PyMuPDF / python-docx are blocking). Problems with the *file itself*
 raise `ProcessingFailure`, which is permanent: retrying will not fix a password-protected or
@@ -76,12 +77,8 @@ def inspect_pdf(
                 "CORRUPT_FILE", "Some pages of this PDF could not be read. The file may be damaged."
             ) from exc
 
-    if pages_without_text == page_count:
-        raise ProcessingFailure(
-            "SCANNED_NO_TEXT",
-            "This PDF has no selectable text. It appears to be a scanned image, so its "
-            "contents cannot be read. Upload a text-based PDF, or run it through OCR first.",
-        )
+    # Pages without a text layer are not a failure here: extraction OCRs them, and only fails
+    # the document if no page yields readable text.
     return InspectionResult(page_count=page_count, pages_without_text=pages_without_text)
 
 

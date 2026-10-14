@@ -46,6 +46,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from app.core.config import get_settings
+from tests.fakes import FakeEmbedder
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -113,15 +114,26 @@ def db_settings(test_database_url: str, tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-async def live_app(db_settings: Settings) -> AsyncIterator[FastAPI]:
-    """The real app with its lifespan running (engine, storage, worker object) on a clean DB."""
-    app = create_app(db_settings)
-    async with app.router.lifespan_context(app):
-        from app.db.session import get_engine
+def fake_embedder() -> FakeEmbedder:
+    return FakeEmbedder()
 
-        async with get_engine().begin() as conn:
-            await conn.execute(text("TRUNCATE documents, jobs CASCADE"))
+
+@pytest.fixture
+async def live_app(db_settings: Settings, fake_embedder: FakeEmbedder) -> AsyncIterator[FastAPI]:
+    """The real app with its lifespan running (engine, storage, worker object) on a clean DB.
+    Embeddings come from a deterministic fake; the real model has its own test."""
+    app = create_app(db_settings, embedder=fake_embedder)
+    async with app.router.lifespan_context(app):
+        await truncate_all()
         yield app
+
+
+async def truncate_all() -> None:
+    """Empty every application table (index tables cascade from documents)."""
+    from app.db.session import get_engine
+
+    async with get_engine().begin() as conn:
+        await conn.execute(text("TRUNCATE documents, jobs CASCADE"))
 
 
 @pytest.fixture

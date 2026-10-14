@@ -11,6 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from app.core.config import APP_VERSION, Settings
+from app.embeddings import Embedder
+from app.ingestion.ocr import tesseract_version
 from app.schemas.health import ComponentCheck, HealthChecks, HealthResponse
 
 logger = logging.getLogger(__name__)
@@ -31,9 +33,12 @@ def _describe(exc: BaseException) -> str:
 
 
 class HealthService:
-    def __init__(self, engine: AsyncEngine, settings: Settings) -> None:
+    def __init__(
+        self, engine: AsyncEngine, settings: Settings, embedder: Embedder | None = None
+    ) -> None:
         self._engine = engine
         self._settings = settings
+        self._embedder = embedder
 
     async def check(self) -> HealthResponse:
         start = time.perf_counter()
@@ -53,9 +58,16 @@ class HealthService:
             migrations_check = ComponentCheck(status="error", detail="database unreachable")
 
         checks = HealthChecks(
-            database=db_check, pgvector=pgvector_check, migrations=migrations_check
+            database=db_check,
+            pgvector=pgvector_check,
+            migrations=migrations_check,
+            ocr=self._check_ocr(),
+            embeddings=self._check_embeddings(),
         )
-        all_ok = all(c.status == "ok" for c in (db_check, pgvector_check, migrations_check))
+        all_ok = all(
+            c.status != "error"
+            for c in (db_check, pgvector_check, migrations_check, checks.ocr, checks.embeddings)
+        )
         return HealthResponse(
             status="ok" if all_ok else "degraded",
             version=APP_VERSION,
@@ -63,6 +75,25 @@ class HealthService:
             llm_configured=self._settings.llm_configured,
             checks=checks,
         )
+
+    def _check_ocr(self) -> ComponentCheck:
+        if not self._settings.ocr_enabled:
+            return ComponentCheck(
+                status="disabled", detail="OCR disabled: scanned pages are reported unreadable"
+            )
+        version = tesseract_version(self._settings.tesseract_cmd)
+        if version is None:
+            return ComponentCheck(
+                status="error", detail="Tesseract not found: set TESSERACT_CMD or OCR_ENABLED=false"
+            )
+        return ComponentCheck(status="ok", detail=f"Tesseract {version}")
+
+    def _check_embeddings(self) -> ComponentCheck:
+        # Never loads the model here (that can take seconds); reports whether it is loaded.
+        if self._embedder is None:
+            return ComponentCheck(status="error", detail="no embedder configured")
+        state = "loaded" if getattr(self._embedder, "loaded", True) else "loads on first use"
+        return ComponentCheck(status="ok", detail=f"{self._embedder.model_name} ({state})")
 
     @staticmethod
     async def _check_pgvector(conn: AsyncConnection) -> ComponentCheck:

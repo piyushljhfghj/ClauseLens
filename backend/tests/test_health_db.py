@@ -9,6 +9,7 @@ import pytest
 from app.core.config import Settings, get_settings
 from app.db.session import create_engine
 from app.services.health import HealthService
+from tests.fakes import FakeEmbedder
 
 
 @pytest.fixture
@@ -19,7 +20,7 @@ def real_settings() -> Settings:
 async def test_health_against_real_database(real_settings: Settings) -> None:
     engine = create_engine(real_settings)
     try:
-        result = await HealthService(engine, real_settings).check()
+        result = await HealthService(engine, real_settings, FakeEmbedder()).check()
     finally:
         await engine.dispose()
 
@@ -28,4 +29,5 @@ async def test_health_against_real_database(real_settings: Settings) -> None:
 
     assert result.checks.pgvector.status == "ok", result.checks.pgvector.detail
     assert result.checks.migrations.status == "ok", result.checks.migrations.detail
-    assert result.status == "ok"
+    assert result.checks.embeddings.status == "ok"
+    assert result.status == ("ok" if result.checks.ocr.status != "error" else "degraded")

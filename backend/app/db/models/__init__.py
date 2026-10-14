@@ -6,6 +6,22 @@ migrations. Tables arrive phase by phase (documents in Phase 2, chunks in Phase 
 
 from app.db.base import Base
 from app.db.models.document import Document
+from app.db.models.index import (
+    DocumentBlock,
+    DocumentChunk,
+    DocumentPage,
+    DocumentSection,
+    DocumentText,
+)
 from app.db.models.job import Job
 
-__all__ = ["Base", "Document", "Job"]
+__all__ = [
+    "Base",
+    "Document",
+    "DocumentBlock",
+    "DocumentChunk",
+    "DocumentPage",
+    "DocumentSection",
+    "DocumentText",
+    "Job",
+]

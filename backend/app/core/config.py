@@ -59,6 +59,21 @@ class Settings(BaseSettings):
     supabase_service_key: SecretStr | None = None
     supabase_storage_bucket: str = "documents"
 
+    # --- Extraction & OCR -----------------------------------------------------------------------
+    # Pages without a usable text layer are OCR'd with Tesseract. Disable only if Tesseract is
+    # not installed; scanned pages are then reported as unreadable rather than silently skipped.
+    ocr_enabled: bool = True
+    ocr_language: str = "eng"
+    ocr_dpi: int = Field(default=300, ge=100, le=600)
+    # Full path to tesseract(.exe) if it is not on PATH.
+    tesseract_cmd: str | None = None
+
+    # --- Embeddings ------------------------------------------------------------------------------
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Where fastembed caches the downloaded ONNX model (~65 MB).
+    embedding_cache_dir: str = ".cache/fastembed"
+    embedding_batch_size: int = Field(default=32, ge=1, le=256)
+
     # --- Background jobs -----------------------------------------------------------------------
     # The worker runs inside the API process. Tests disable it and drive jobs explicitly.
     worker_enabled: bool = True
@@ -81,7 +96,12 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "llm_base_url", "llm_model", "cors_origin_regex", "supabase_url", mode="before"
+        "llm_base_url",
+        "llm_model",
+        "cors_origin_regex",
+        "supabase_url",
+        "tesseract_cmd",
+        mode="before",
     )
     @classmethod
     def _blank_to_none(cls, value: object) -> object:

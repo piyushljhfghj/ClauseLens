@@ -22,8 +22,10 @@ def test_mixed_pdf_counts_pages_without_text() -> None:
     assert (result.page_count, result.pages_without_text) == (2, 1)
 
 
-def test_scanned_pdf_fails_instead_of_becoming_an_empty_document() -> None:
-    assert failure_code(inspect_pdf, factory.scanned_pdf(), max_pages=100) == "SCANNED_NO_TEXT"
+def test_scanned_pdf_passes_inspection_with_pages_flagged_for_ocr() -> None:
+    # Whether a scanned PDF is usable is decided after OCR (see test_extract_pdf).
+    result = inspect_pdf(factory.scanned_pdf(pages=2), max_pages=100)
+    assert (result.page_count, result.pages_without_text) == (2, 2)
 
 
 def test_password_protected_pdf() -> None:

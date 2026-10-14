@@ -21,6 +21,8 @@ out/
 
 # --- Local data ---
 backend/storage/
+# Downloaded embedding model files
+.cache/
 *.log
 
 # --- Editors / OS ---

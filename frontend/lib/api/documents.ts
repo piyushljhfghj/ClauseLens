@@ -5,6 +5,8 @@ import { API_BASE_URL } from "@/lib/config";
 export type DocumentOut = components["schemas"]["DocumentOut"];
 export type DocumentList = components["schemas"]["DocumentList"];
 export type DocumentStatus = DocumentOut["status"];
+export type SectionOut = components["schemas"]["SectionOut"];
+export type PageOut = components["schemas"]["PageOut"];
 
 export function listDocuments(signal?: AbortSignal): Promise<DocumentList> {
   return apiRequest<DocumentList>("/api/documents", { signal });
@@ -22,6 +24,22 @@ export function reprocessDocument(id: string): Promise<DocumentOut> {
   return apiRequest<DocumentOut>(`/api/documents/${encodeURIComponent(id)}/reprocess`, {
     method: "POST",
   });
+}
+
+export async function getOutline(id: string, signal?: AbortSignal): Promise<SectionOut[]> {
+  const body = await apiRequest<components["schemas"]["DocumentOutline"]>(
+    `/api/documents/${encodeURIComponent(id)}/outline`,
+    { signal },
+  );
+  return body.sections;
+}
+
+export async function getPages(id: string, signal?: AbortSignal): Promise<PageOut[]> {
+  const body = await apiRequest<components["schemas"]["DocumentPages"]>(
+    `/api/documents/${encodeURIComponent(id)}/pages`,
+    { signal },
+  );
+  return body.pages;
 }
 
 export function documentFileUrl(id: string, { download = false } = {}): string {

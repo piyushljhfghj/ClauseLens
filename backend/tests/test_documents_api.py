@@ -10,6 +10,9 @@ from sqlalchemy import func, select
 from app.core.config import Settings
 from app.db.models import Document, Job
 from app.db.session import get_sessionmaker
+from app.main import create_app
+from tests.conftest import truncate_all
+from tests.fakes import FakeEmbedder
 from tests.fixtures import factory
 
 
@@ -153,21 +156,29 @@ async def test_duplicate_upload_is_rejected_with_existing_id(api: httpx.AsyncCli
 async def test_reupload_of_a_failed_document_is_allowed(
     api: httpx.AsyncClient, live_app: FastAPI
 ) -> None:
-    scanned = factory.scanned_pdf()
-    await upload(api, "scan.pdf", scanned)
+    locked = factory.encrypted_pdf()
+    await upload(api, "locked.pdf", locked)
     await process_all(live_app)
-    assert (await upload(api, "scan.pdf", scanned)).status_code == 202
+    assert (await upload(api, "locked.pdf", locked)).status_code == 202
 
 
 # --- processing failures: never "ready" ----------------------------------------------------------
 
 
-async def test_scanned_pdf_fails_with_clear_reason(
-    api: httpx.AsyncClient, live_app: FastAPI
+async def test_scanned_pdf_without_ocr_fails_with_clear_reason(
+    db_settings: Settings, fake_embedder: FakeEmbedder
 ) -> None:
-    created = (await upload(api, "scan.pdf", factory.scanned_pdf())).json()
-    await process_all(live_app)
-    document = (await api.get(f"/api/documents/{created['id']}")).json()
+    # With OCR switched off, a fully scanned PDF must fail, never become an empty "ready" doc.
+    app = create_app(db_settings.model_copy(update={"ocr_enabled": False}), embedder=fake_embedder)
+    async with app.router.lifespan_context(app):
+        await truncate_all()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+            response = await upload(api, "scan.pdf", factory.scanned_pdf())
+            assert response.status_code == 202, response.text
+            created = response.json()
+            await process_all(app)
+            document = (await api.get(f"/api/documents/{created['id']}")).json()
     assert document["status"] == "failed"
     assert document["error_code"] == "SCANNED_NO_TEXT"
     assert "scanned" in document["error_message"]
@@ -183,7 +194,7 @@ async def test_password_protected_pdf_fails(api: httpx.AsyncClient, live_app: Fa
 async def test_permanent_failures_are_not_retried(
     api: httpx.AsyncClient, live_app: FastAPI
 ) -> None:
-    await upload(api, "scan.pdf", factory.scanned_pdf())
+    await upload(api, "locked.pdf", factory.encrypted_pdf())
     await process_all(live_app)
     async with get_sessionmaker()() as session:
         job = (await session.execute(select(Job))).scalar_one()

@@ -13,13 +13,16 @@ from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware, UploadSizeLimitMiddleware
 from app.db.session import dispose_engine, get_sessionmaker, init_engine
+from app.embeddings import Embedder, FastEmbedEmbedder
+from app.ingestion.ocr import tesseract_version
 from app.jobs.worker import JobWorker
 from app.storage import build_storage
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, embedder: Embedder | None = None) -> FastAPI:
+    """`embedder` can be injected (tests use a fast deterministic fake)."""
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_format)
 
@@ -28,7 +31,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         init_engine(settings)
         storage = build_storage(settings)
         app.state.storage = storage
-        worker = JobWorker(get_sessionmaker(), storage, settings)
+        app.state.embedder = embedder or FastEmbedEmbedder(
+            settings.embedding_model,
+            cache_dir=settings.embedding_cache_dir,
+            batch_size=settings.embedding_batch_size,
+        )
+        worker = JobWorker(get_sessionmaker(), storage, settings, app.state.embedder)
         app.state.worker = worker
         if settings.worker_enabled:
             worker.start()
@@ -40,6 +48,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "cors_origins": settings.cors_origin_list,
                 "llm_configured": settings.llm_configured,
                 "storage": settings.storage_backend,
+                "ocr": (
+                    (tesseract_version(settings.tesseract_cmd) or "unavailable")
+                    if settings.ocr_enabled
+                    else "disabled"
+                ),
+                "embedding_model": settings.embedding_model,
                 "worker": settings.worker_enabled,
             },
         )

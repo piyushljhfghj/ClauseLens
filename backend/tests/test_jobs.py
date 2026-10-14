@@ -154,7 +154,7 @@ async def test_progress_is_visible_while_processing(
     seen = (await api.get(f"/api/documents/{document_id}")).json()
     assert seen["status"] == "processing"
     assert seen["stage"] == "inspecting"
-    assert seen["progress"] == 50  # 5 + (95 - 5) * 0.5
+    assert seen["progress"] == 4  # inspection spans 2-5% overall: round(2 + 3 * 0.5)
 
     blocker.release.set()
     await run

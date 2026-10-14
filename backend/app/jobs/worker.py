@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.db.models import Document
+from app.embeddings import Embedder
 from app.ingestion.inspect import ProcessingFailure
 from app.ingestion.pipeline import ProgressReporter, ingest_document
 from app.jobs import queue
@@ -41,10 +42,12 @@ class JobWorker:
         sessionmaker: async_sessionmaker[AsyncSession],
         storage: Storage,
         settings: Settings,
+        embedder: Embedder,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._storage = storage
         self._settings = settings
+        self._embedder = embedder
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._handlers: dict[str, JobHandler] = {"ingest": self._handle_ingest}
@@ -147,18 +150,18 @@ class JobWorker:
         return True
 
     async def _heartbeat(self, job: queue.ClaimedJob, progress: ProgressReporter) -> None:
-        last_reported: tuple[str, int] | None = None
+        last_reported: tuple[str, int, str | None] | None = None
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_S)
             try:
                 async with self._sessionmaker() as session:
                     await queue.heartbeat(session, job.id)
-                    current = (progress.stage, progress.progress)
+                    current = (progress.stage, progress.progress, progress.detail)
                     if job.document_id and current != last_reported:
                         await session.execute(
                             update(Document)
                             .where(Document.id == job.document_id, Document.status == "processing")
-                            .values(stage=current[0], progress=current[1])
+                            .values(stage=current[0], progress=current[1], stage_detail=current[2])
                         )
                         last_reported = current
                     await session.commit()
@@ -175,7 +178,11 @@ class JobWorker:
                     update(Document)
                     .where(Document.id == job.document_id)
                     .values(
-                        status="failed", stage=None, error_code=code, error_message=user_message
+                        status="failed",
+                        stage=None,
+                        stage_detail=None,
+                        error_code=code,
+                        error_message=user_message,
                     )
                 )
             await session.commit()
@@ -187,7 +194,7 @@ class JobWorker:
                 await session.execute(
                     update(Document)
                     .where(Document.id == job.document_id)
-                    .values(status="queued", stage="retrying", progress=0)
+                    .values(status="queued", stage="retrying", stage_detail=None, progress=0)
                 )
             await session.commit()
 
@@ -200,5 +207,6 @@ class JobWorker:
             sessionmaker=self._sessionmaker,
             storage=self._storage,
             settings=self._settings,
+            embedder=self._embedder,
             progress=progress,
         )

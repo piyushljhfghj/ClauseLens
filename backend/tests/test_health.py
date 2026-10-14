@@ -19,7 +19,9 @@ class StubHealthService:
             version="test",
             environment="test",
             llm_configured=False,
-            checks=HealthChecks(database=check, pgvector=check, migrations=check),
+            checks=HealthChecks(
+                database=check, pgvector=check, migrations=check, ocr=check, embeddings=check
+            ),
         )
 
 

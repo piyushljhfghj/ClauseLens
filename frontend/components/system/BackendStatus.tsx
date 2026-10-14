@@ -131,6 +131,16 @@ export function BackendStatus() {
           ok={health ? health.checks.migrations.status === "ok" : apiReachable === false ? false : null}
           detail={health?.checks.migrations.detail}
         />
+        <Row
+          label="OCR (Tesseract)"
+          ok={health ? health.checks.ocr.status !== "error" : apiReachable === false ? false : null}
+          detail={health?.checks.ocr.detail}
+        />
+        <Row
+          label="Embedding model"
+          ok={health ? health.checks.embeddings.status === "ok" : apiReachable === false ? false : null}
+          detail={health?.checks.embeddings.detail}
+        />
       </ul>
 
       {health && !health.llm_configured ? (

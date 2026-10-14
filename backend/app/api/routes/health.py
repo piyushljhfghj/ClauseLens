@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.core.config import Settings, get_settings
 from app.db.session import get_engine
@@ -10,8 +10,10 @@ from app.services.health import HealthService
 router = APIRouter(prefix="/api/health", tags=["health"])
 
 
-def get_health_service(settings: Annotated[Settings, Depends(get_settings)]) -> HealthService:
-    return HealthService(get_engine(), settings)
+def get_health_service(
+    request: Request, settings: Annotated[Settings, Depends(get_settings)]
+) -> HealthService:
+    return HealthService(get_engine(), settings, getattr(request.app.state, "embedder", None))
 
 
 @router.get(

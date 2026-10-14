@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen, RefreshCw } from "lucide-react";
+import { AlertTriangle, FolderOpen, RefreshCw, RotateCcw } from "lucide-react";
 import { useCallback } from "react";
 
 import { DocumentList } from "@/components/library/DocumentList";
@@ -58,6 +58,24 @@ export function Library() {
       </div>
 
       <section aria-label="Documents" className="mt-8">
+        {documents.data && documents.data.items.some((d) => d.needs_reprocessing) ? (
+          <div className="mb-3 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 sm:flex-row sm:items-center dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <AlertTriangle aria-hidden className="h-5 w-5 shrink-0" />
+            <p className="flex-1">
+              {documents.data.items.filter((d) => d.needs_reprocessing).length} document(s) were stored before text
+              extraction and indexing were available. They can&apos;t be searched until they are reprocessed.
+            </p>
+            <button
+              type="button"
+              className={buttonClass("secondary")}
+              onClick={() => documents.data.items.filter((d) => d.needs_reprocessing).forEach(actions.retry)}
+            >
+              <RotateCcw aria-hidden className="h-4 w-4" />
+              Reprocess all
+            </button>
+          </div>
+        ) : null}
+
         {actions.retryError ? (
           <p role="alert" className="mb-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
             {actions.retryError}

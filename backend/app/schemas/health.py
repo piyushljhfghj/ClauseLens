@@ -2,7 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-CheckStatus = Literal["ok", "error"]
+# "disabled": intentionally switched off by configuration; not counted as a failure.
+CheckStatus = Literal["ok", "error", "disabled"]
 
 
 class ComponentCheck(BaseModel):
@@ -17,6 +18,8 @@ class HealthChecks(BaseModel):
     database: ComponentCheck
     pgvector: ComponentCheck
     migrations: ComponentCheck
+    ocr: ComponentCheck
+    embeddings: ComponentCheck
 
 
 class HealthResponse(BaseModel):

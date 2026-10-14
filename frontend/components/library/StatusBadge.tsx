@@ -1,22 +1,37 @@
-import { AlertCircle, CheckCircle2, Loader2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, Loader2 } from "lucide-react";
 
 import type { DocumentOut } from "@/lib/api/documents";
 import { isInFlight, statusLabel } from "@/lib/documents";
 
-export function StatusBadge({ document }: { document: Pick<DocumentOut, "status" | "stage" | "progress"> }) {
+type BadgeDocument = Pick<DocumentOut, "status" | "stage" | "stage_detail" | "progress" | "indexed">;
+
+const pill = "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium";
+
+export function StatusBadge({ document }: { document: BadgeDocument }) {
   const label = statusLabel(document);
 
+  if (document.status === "ready" && document.indexed) {
+    return (
+      <span className={`${pill} bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300`}>
+        <CheckCircle2 aria-hidden className="h-3.5 w-3.5" />
+        {label}
+      </span>
+    );
+  }
   if (document.status === "ready") {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
-        <CheckCircle2 aria-hidden className="h-3.5 w-3.5" />
+      <span
+        title="Stored and checked, but not yet extracted and indexed. Reprocess to make it searchable."
+        className={`${pill} bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300`}
+      >
+        <AlertTriangle aria-hidden className="h-3.5 w-3.5" />
         {label}
       </span>
     );
   }
   if (document.status === "failed") {
     return (
-      <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700 dark:bg-red-950/60 dark:text-red-300">
+      <span className={`${pill} bg-red-50 text-red-700 dark:bg-red-950/60 dark:text-red-300`}>
         <AlertCircle aria-hidden className="h-3.5 w-3.5" />
         {label}
       </span>
@@ -36,7 +51,7 @@ export function StatusBadge({ document }: { document: Pick<DocumentOut, "status"
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={document.progress}
-          className="block h-1 w-28 overflow-hidden rounded-full bg-indigo-100 dark:bg-indigo-950"
+          className="block h-1 w-32 overflow-hidden rounded-full bg-indigo-100 dark:bg-indigo-950"
         >
           <span
             className="block h-full rounded-full bg-indigo-500 transition-[width] duration-500"
@@ -44,6 +59,7 @@ export function StatusBadge({ document }: { document: Pick<DocumentOut, "status"
           />
         </span>
       ) : null}
+      {document.stage_detail ? <span className="text-xs text-zinc-500">{document.stage_detail}</span> : null}
     </span>
   );
 }

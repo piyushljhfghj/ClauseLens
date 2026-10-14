@@ -73,7 +73,8 @@ citation) is a `[char_start, char_end)` range into it.
 |---|---|
 | `GET /api/health` (readiness: DB, pgvector, migrations; 503 when degraded) · `GET /api/health/live` | 1 ✅ |
 | `POST /api/documents` (multipart, magic-byte validation) · `GET /api/documents[/{id}]` · `DELETE` · `GET /{id}/file` · `POST /{id}/reprocess` | 2 ✅ |
-| `GET /api/documents/{id}/layout` · `/{id}/outline` | 3 |
+| `GET /api/documents/{id}/outline` (section tree) · `/{id}/pages` (per-page extraction status) | 3 ✅ |
+| `GET /api/documents/{id}/layout` (word boxes / blocks for the viewer) | 7 |
 | `POST /api/chats` · `GET /api/chats?document_id=` · `GET/DELETE /api/chats/{id}` | 8 |
 | `POST /api/chats/{id}/messages` → SSE · `POST /api/chats/{id}/messages/{mid}/stop` | 5–8 |
 | `POST /api/comparisons` · `GET /api/comparisons/{id}?type=&significance=&sort=` | 11 |
@@ -104,21 +105,61 @@ TypeScript types are generated from the OpenAPI schema (`npm run gen:api`).
   MuPDF repairs damaged files; unrecoverable pages show up as pages without text.
 - *Storage*: `Storage` protocol with `LocalStorage` (dev) and `SupabaseStorage` (REST, private
   bucket, server-side key; files are always streamed through the API).
-- At this phase `ready` means *stored and inspected*. Phase 3 inserts the stages below before `ready`.
+- In Phase 2 `ready` meant *stored and inspected*. Phase 3 added the stages below; documents
+  processed before that have `index_version = NULL` and are reported as `needs_reprocessing`.
 
-**Phase 3**
+**Implemented in Phase 3 ✅** — `download → inspect → extract (+OCR) → structure → chunk → embed → save`
 
-1. **Detect** — done in Phase 2 (above).
-2. **Extract words with boxes**: PyMuPDF for text PDFs; pages with no text layer are OCR'd with
-   Tesseract (word boxes → PDF points). If no usable text results: `failed: SCANNED_NO_TEXT`,
-   never an empty "ready" document. DOCX: body walked in order (paragraphs and tables) with a
-   **numbering resolver**, because Word auto-numbers (`8.2`) are not in the paragraph text.
-3. **Remove page furniture** (repeated headers/footers, page numbers) from the canonical text so
-   sentences crossing a page break are contiguous.
-4. **Canonical text**: words joined by spaces, lines by `\n`, blocks/pages by `\n\n`; each word keeps its range → box mapping.
-5. **Structure**: numbering patterns + font cues / DOCX styles → section tree.
-6. **Chunking**: whole blocks packed to ~350 tokens (max 500), never across top-level sections; `context_text = section_path + text` is what is embedded and BM25-indexed.
-7. **Embed + index**; status `ready`. Every stage updates `stage`/`progress` for the UI.
+1. **Extract words with boxes** (`pdf_extract.py`): PyMuPDF `rawdict` (per-character boxes; ligatures
+   expanded), grouped into words on whitespace. Boxes are transformed with the page's rotation
+   matrix into *displayed-page* coordinates (PDF points, origin top-left, page size = `page.rect`),
+   so the viewer only scales. MuPDF blocks are split wherever a line starts a numbered clause.
+2. **OCR** (`ocr.py`): a page is OCR'd when (a) it has < 20 text-layer characters but visible
+   content (dark pixels in a 30-DPI render: scans, handwriting, vector-drawn text), or (b) it has
+   < 200 characters and images cover ≥ 50% of it (a scan carrying a typed stamp / Bates number);
+   in case (b) the OCR text replaces the text layer only if it adds ≥ 50 characters. Rendering at
+   `OCR_DPI` (grey) and Tesseract `image_to_data` give word boxes in the same coordinate space,
+   mean confidence stored per page. Page outcome: `text` | `ocr` | `none` with note `blank`
+   (no visible content) | `ocr_unavailable` | `ocr_failed` | `ocr_no_text` (visible content, no
+   recognisable text). `unreadable_page_count` counts those unreadable notes (content may exist
+   but was not read) and is surfaced in the API/UI with explicit warnings. An OCR page whose mean
+   word confidence is below 50% keeps its text and stays indexed, but gets note
+   `ocr_low_quality`: counted separately in `low_quality_page_count`, warned about ("content may be
+   largely unrecognised; answers based on these pages may be incomplete") and shown as a distinct
+   striped amber cell in the coverage strip — partially read, neither "read" nor "unreadable".
+   A PDF fails (`SCANNED_NO_TEXT`) only if no page yields text.
+3. **Furniture** (`furniture.py`): lines in the top/bottom 10% of the page whose digit-normalised
+   text repeats on ≥ 50% of pages (min. 2), or that are bare page numbers, are dropped.
+4. **DOCX** (`docx_extract.py`, `docx_numbering.py`): body walked in order (paragraphs, tables,
+   content controls); run text read directly so tracked insertions count, deletions do not, and
+   tab-stop definitions are not text; Word auto-numbering resolved from `numbering.xml`
+   (levels, formats, restarts, start overrides, style-inherited numbering) and prefixed.
+   No pages. Not extracted: text boxes, footnotes, headers/footers.
+5. **Canonical text** (`model.py`): words joined by spaces, lines by `\n`, blocks/pages by
+   `\n\n` (all whitespace, so verification can collapse them). Page and block ranges recorded.
+6. **Structure** (`structure.py`): numbered patterns (`8.`, `8.2`, `Section 12.3`, `Article IV`,
+   `Schedule 2`; guards against "30 days", "100,000", "2026.") + emphasis (DOCX heading styles /
+   outline level / all-runs-bold paragraphs; PDF font ≥ 1.15× body size, bold, ALL CAPS) →
+   section tree; each section spans until the next sibling-or-higher section. Emphasis rules are
+   not applied to OCR text (no reliable typography; recognition noise is often short and
+   upper-case). A run of consecutive unnumbered headings is a title block: only the last line
+   before body text becomes a section (numbered and Word-styled headings are never demoted).
+   Titles: short heading text, a short leading phrase ending in "." or "?" ("8.2 Termination for
+   Convenience. …"), or a single-line numbered question; lead-ins ending in ":" are not titles.
+   Untitled sections get a display-only `preview` (opening words) in the outline API.
+   `INDEX_VERSION` history: 2 = Phase 3 audit fixes; 3 = low-quality OCR classification
+   (migration `0004` adds `low_quality_page_count`). Older indexes are reported as needing
+   reprocessing.
+7. **Chunking** (`chunking.py`): whole blocks packed to ~1,200 chars (max 1,800; oversized
+   paragraphs split at sentence boundaries); never across top-level sections; headings stay with
+   their text; **no overlap and no gaps** (tested invariant). `context_text = section path +
+   index-normalised text` is embedded; BM25 tokens (`text/tokenize.py`) stored per chunk.
+8. **Embeddings** (`embeddings.py`): fastembed `BAAI/bge-small-en-v1.5`, 384-d, L2-normalised,
+   lazy-loaded once per process, run in a thread with per-batch progress. Baked into the Docker
+   image. Tests inject a deterministic fake; one test exercises the real model.
+9. **Save** (`index_writer.py`): document row locked, old index rows deleted and new ones inserted,
+   document set `ready` with `index_version`, counts and warnings, all in **one transaction**.
+   A failed re-index leaves the previous complete index untouched.
 
 ## 6. Retrieval and generation (Phases 4–5, 9–10)
 
