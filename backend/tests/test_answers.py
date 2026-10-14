@@ -9,13 +9,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from pydantic import SecretStr
-from sqlalchemy import event, update
+from sqlalchemy import delete, event, select, update
 from sqlalchemy import text as text_interval
 from sqlalchemy.exc import OperationalError
 
 from app.answering.prompt import INSUFFICIENT_ANSWER
 from app.core.config import Settings
-from app.db.models import Document, DocumentPage, DocumentText
+from app.db.models import Document, DocumentBlock, DocumentPage, DocumentText
 from app.db.session import get_engine, get_sessionmaker
 from app.ingestion import pdf_extract
 from app.ingestion.model import SourceBlock, SourceLine, SourceWord
@@ -1091,3 +1091,261 @@ async def test_unexpected_errors_in_the_geometry_step_are_not_hidden(
         event.remove(engine, "before_cursor_execute", hook)
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "INTERNAL_ERROR"
+
+
+# --- Word citation block ranges (Phase 6, task 5) -------------------------------------------------
+
+TERMINATION_CLAUSE = (
+    "2.1 Either party may terminate this Agreement on thirty (30) days written notice."
+)
+
+
+async def stored_blocks(document_id: str) -> list[DocumentBlock]:
+    async with get_sessionmaker()() as session:
+        rows = await session.execute(
+            select(DocumentBlock)
+            .where(DocumentBlock.document_id == uuid.UUID(document_id))
+            .order_by(DocumentBlock.ordinal)
+        )
+        return list(rows.scalars())
+
+
+def quoting(anchor: str, *quotes: str) -> Callable[[list[ChatMessage]], str]:
+    """A model that cites the evidence passage containing `anchor` for each quote."""
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), anchor)
+        markers = " ".join(f"Point [{n}]." for n in range(1, len(quotes) + 1))
+        return answer_output(
+            markers, [{"n": n, "evidence": e, "quote": q} for n, q in enumerate(quotes, 1)]
+        )
+
+    return script
+
+
+async def assert_block_ranges_match(document_id: str, citation: dict) -> None:  # type: ignore[type-arg]
+    """Every range lies in its stored block, and together they spell the verified quote."""
+    text = await canonical(document_id)
+    blocks = {b.ordinal: b for b in await stored_blocks(document_id)}
+    pieces = []
+    for r in citation["block_ranges"]:
+        block = blocks[r["block"]]
+        assert (r["kind"], r["block_char_start"], r["block_char_end"]) == (
+            block.kind,
+            block.char_start,
+            block.char_end,
+        )
+        block_text = text[block.char_start : block.char_end]
+        assert 0 <= r["start"] < r["end"] <= len(block_text)
+        pieces.append(block_text[r["start"] : r["end"]])
+    assert "\n\n".join(pieces) == citation["quote"]
+    assert citation["highlights"] == []  # Word documents have no page rectangles
+
+
+@pytest.fixture
+async def numbered(api: httpx.AsyncClient, answer_app: FastAPI) -> str:
+    return await upload(api, answer_app, "msa.docx", factory.numbered_docx())
+
+
+async def test_docx_quote_in_a_numbered_clause_gets_its_block_range(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting("terminate this Agreement", TERMINATION_CLAUSE)
+    citation = (await ask(api, "How can the agreement be terminated?", numbered))["citations"][0]
+    assert citation["status"] == "verified" and citation["reason"] is None
+    (r,) = citation["block_ranges"]
+    assert r["kind"] == "paragraph" and r["start"] == 0  # the "2.1" label is part of the block
+    await assert_block_ranges_match(numbered, citation)
+
+
+async def test_docx_quote_across_paragraphs_and_a_table_row(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    text = await canonical(numbered)
+    across = text[text.index("becomes insolvent.") : text.index("LIABILITY") + len("LIABILITY")]
+    row = "Fee\nAED 100,000"
+    assert across.count("\n\n") == 1 and row in text
+    llm.script = quoting("terminate this Agreement", across, row)
+    result = await ask(api, "How can the agreement be terminated?", numbered)
+    first, second = result["citations"]
+    assert first["status"] == second["status"] == "verified"
+    # "3. LIABILITY" is stored as a heading block by structure detection.
+    assert [r["kind"] for r in first["block_ranges"]] == ["paragraph", "heading"]
+    assert [r["kind"] for r in second["block_ranges"]] == ["table_row"]
+    await assert_block_ranges_match(numbered, first)
+    await assert_block_ranges_match(numbered, second)
+
+
+async def test_docx_manual_line_break_stays_in_one_block(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    paragraphs = ["Notices must be given in writing.\nEmail counts as writing for notices."]
+    document = await upload(api, answer_app, "notices.docx", factory.docx_file(paragraphs))
+    assert "in writing.\nEmail counts" in await canonical(document)
+    llm.script = quoting("Email counts", "given in writing.\nEmail counts as writing")
+    citation = (await ask(api, "How must notices be given in writing?", document))["citations"][0]
+    assert citation["status"] == "verified" and len(citation["block_ranges"]) == 1
+    await assert_block_ranges_match(document, citation)
+
+
+async def test_docx_repeated_paragraph_uses_the_verifiers_occurrence(
+    api: httpx.AsyncClient, answer_app: FastAPI, llm: FakeLLM
+) -> None:
+    repeated = "Pricing follows the Order Form agreed by the parties."
+    paragraphs = [
+        "1. Fees are payable monthly in advance by the Customer.",
+        repeated,
+        "2. Payment terms are thirty days from the date of each invoice.",
+        repeated,
+    ]
+    document = await upload(api, answer_app, "pricing.docx", factory.docx_file(paragraphs))
+    llm.script = quoting("Payment terms", repeated)
+    citation = (await ask(api, "What are the payment terms for each invoice?", document))[
+        "citations"
+    ][0]
+    assert citation["status"] == "verified" and citation["occurrence_count"] == 2
+    (r,) = citation["block_ranges"]
+    # The block is the one holding the verifier's chosen range, never another occurrence.
+    assert r["block_char_start"] <= citation["char_start"] < r["block_char_end"]
+    assert citation["char_start"] - r["block_char_start"] == r["start"]
+    await assert_block_ranges_match(document, citation)
+
+
+async def test_unverified_docx_quote_gets_no_block_ranges(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting(
+        "terminate this Agreement", "Either party may terminate this Agreement at any time"
+    )
+    citation = (await ask(api, "How can the agreement be terminated?", numbered))["citations"][0]
+    assert citation["status"] == "unverified" and citation["block_ranges"] == []
+
+
+async def test_pdf_citations_use_highlights_not_block_ranges(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting("terminate this Agreement", "Either party may terminate this Agreement")
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "verified" and citation["highlights"]
+    assert citation["block_ranges"] == [] and citation["reason"] is None
+
+
+async def test_verified_pdf_quote_on_no_stored_page_is_explained(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    # Page records that no longer cover the quote: it stays verified, is not presented as a
+    # Word citation, and says why it is not highlighted.
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            delete(DocumentPage).where(
+                DocumentPage.document_id == uuid.UUID(contract), DocumentPage.page_number == 2
+            )
+        )
+        await session.commit()
+    llm.script = quoting("terminate this Agreement", "Either party may terminate this Agreement")
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "verified" and citation["page_start"] is None
+    assert citation["highlights"] == [] and citation["block_ranges"] == []
+    assert "could not be determined from the extracted layout" in citation["reason"]
+
+
+async def test_docx_reprocessed_during_the_answer_gets_no_block_ranges(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting("terminate this Agreement", TERMINATION_CLAUSE)
+    complete = llm.complete
+
+    async def reprocessed_meanwhile(messages: list[ChatMessage]) -> LLMResult:
+        async with get_sessionmaker()() as session:
+            await session.execute(
+                update(Document)
+                .where(Document.id == uuid.UUID(numbered))
+                .values(processed_at=text_interval("now() + interval '1 minute'"))
+            )
+            await session.commit()
+        return await complete(messages)
+
+    llm.complete = reprocessed_meanwhile  # type: ignore[method-assign]
+    citation = (await ask(api, "How can the agreement be terminated?", numbered))["citations"][0]
+    assert citation["status"] == "verified" and citation["block_ranges"] == []
+    assert "could not be determined from the extracted text structure" in citation["reason"]
+
+
+def fail_block_query(error: Exception):  # type: ignore[no-untyped-def]
+    def hook(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        if "FROM blocks" in statement and "documents.processed_at" in statement:
+            raise error
+
+    return hook
+
+
+async def test_docx_block_query_failure_keeps_the_verified_answer(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting("terminate this Agreement", TERMINATION_CLAUSE)
+    hook = fail_block_query(OperationalError("SELECT ...", {}, OSError("connection lost")))
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", hook)
+    try:
+        response = await api.post(
+            ANSWERS,
+            json={"question": "How can the agreement be terminated?", "document_ids": [numbered]},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", hook)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["grounding"] == "grounded"
+    citation = result["citations"][0]
+    assert citation["status"] == "verified" and citation["quote"] == TERMINATION_CLAUSE
+    text = await canonical(numbered)
+    assert text[citation["char_start"] : citation["char_end"]] == citation["quote"]
+    assert citation["block_ranges"] == []
+    assert citation["reason"] == (
+        "Its location in the document could not be loaded just now, so it is not highlighted."
+    )
+    assert get_engine().pool.checkedout() == 0
+
+
+async def test_unexpected_errors_in_the_block_step_are_not_hidden(
+    api: httpx.AsyncClient, numbered: str, llm: FakeLLM
+) -> None:
+    llm.script = quoting("terminate this Agreement", TERMINATION_CLAUSE)
+    hook = fail_block_query(RuntimeError("a bug, not a database failure"))
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", hook)
+    try:
+        response = await api.post(
+            ANSWERS,
+            json={"question": "How can the agreement be terminated?", "document_ids": [numbered]},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", hook)
+    assert response.status_code == 500
+
+
+async def test_only_blocks_overlapping_the_cited_range_are_queried(
+    api: httpx.AsyncClient, answer_app: FastAPI, numbered: str, llm: FakeLLM
+) -> None:
+    other = await upload(
+        api, answer_app, "other.docx", factory.docx_file(["Either party may terminate on notice."])
+    )
+    statements: list[list[str]] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+        if "FROM blocks" in statement and "documents.processed_at" in statement:
+            statements.append([str(p) for p in parameters])
+
+    llm.script = quoting("2.1 Either party", TERMINATION_CLAUSE)
+    engine = get_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = await ask(api, "How can the agreement be terminated?", numbered, other)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    citation = result["citations"][0]
+    assert citation["status"] == "verified" and citation["document_id"] == numbered
+    # One query: the cited document and the cited range only (document id, range end, start).
+    assert len(statements) == 1
+    assert statements[0] == [numbered, str(citation["char_end"]), str(citation["char_start"])]
+    assert len(citation["block_ranges"]) == 1

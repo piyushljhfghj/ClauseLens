@@ -26,13 +26,14 @@ from app.answering.integrity import corruption, degenerate_repetition, uncited_s
 from app.answering.parser import ProposedCitation, parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.core.config import Settings
-from app.db.models import Document, DocumentPage, DocumentText
+from app.db.models import Document, DocumentBlock, DocumentPage, DocumentText
 from app.embeddings import Embedder
 from app.ingestion.model import LOW_QUALITY_NOTE
 from app.llm import INCOMPLETE_OUTPUT, LLMClient, LLMNotConfiguredError, LLMOutputInvalidError
 from app.retrieval.service import RetrievalService
 from app.schemas.answers import (
     AnswerResponse,
+    BlockRange,
     CitationOut,
     EvidenceOut,
     ExcludedPassage,
@@ -40,6 +41,7 @@ from app.schemas.answers import (
     HighlightRect,
 )
 from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
+from app.verification.blocks import StoredBlock, block_ranges
 from app.verification.geometry import PageGeometry, highlight_boxes
 from app.verification.normalize import normalize
 from app.verification.quotes import EvidenceText, QuoteCheck, SourceDocument, verify_quote
@@ -64,7 +66,17 @@ class PageRecord:
 
 
 PageRecords = dict[uuid.UUID, list[PageRecord]]  # document -> its pages, in page order
-Versions = dict[uuid.UUID, object]  # document -> processed_at of the snapshot answered from
+
+
+@dataclass(frozen=True)
+class DocumentVersion:
+    """A document as of the snapshot the answer was built from."""
+
+    processed_at: object  # changes on every (re)processing
+    file_type: str  # pdf | docx
+
+
+Versions = dict[uuid.UUID, DocumentVersion]
 
 NOT_HIGHLIGHTED = (
     "Its position on the page could not be determined from the extracted layout, so it is not "
@@ -72,6 +84,13 @@ NOT_HIGHLIGHTED = (
 )
 HIGHLIGHTS_UNAVAILABLE = (
     "Its position on the page could not be loaded just now, so it is not highlighted."
+)
+BLOCKS_NOT_LOCATED = (
+    "Its location in the document could not be determined from the extracted text structure, "
+    "so it is not highlighted."
+)
+BLOCKS_UNAVAILABLE = (
+    "Its location in the document could not be loaded just now, so it is not highlighted."
 )
 
 
@@ -190,6 +209,7 @@ class AnswerService:
             lambda: [self._verify(c, evidence, sources, pages) for c in parsed.citations]
         )
         citations = await self._add_highlights(citations, sources, versions)
+        citations = await self._add_block_ranges(citations, sources, versions)
         grounding, grounding_notes = _grounding(
             parsed.markers, citations, uncited_statements(parsed.answer)
         )
@@ -224,9 +244,13 @@ class AnswerService:
         if not document_ids:
             return {}, {}, {}
         version_rows = await self._session.execute(
-            select(Document.id, Document.processed_at).where(Document.id.in_(document_ids))
+            select(Document.id, Document.processed_at, Document.file_type).where(
+                Document.id.in_(document_ids)
+            )
         )
-        versions: Versions = {row.id: row.processed_at for row in version_rows}
+        versions: Versions = {
+            row.id: DocumentVersion(row.processed_at, row.file_type) for row in version_rows
+        }
         texts = await self._session.execute(
             select(DocumentText.document_id, DocumentText.canonical_text).where(
                 DocumentText.document_id.in_(document_ids)
@@ -272,12 +296,14 @@ class AnswerService:
         the pages they are on. Read after the LLM call (the answer's snapshot is closed), so a
         document reprocessed meanwhile (different `processed_at`) gets no rectangles rather than
         boxes from another version of its text."""
+        if not any(_located_in(c, versions, "pdf") for c in citations):
+            return citations
         wanted: dict[uuid.UUID, set[int]] = defaultdict(set)
         for c in citations:
-            if c.status == "verified" and c.document_id and c.page_start and c.page_end:
+            if _located_in(c, versions, "pdf") and c.document_id and c.page_start and c.page_end:
                 wanted[c.document_id].update(range(c.page_start, c.page_end + 1))
-        if not wanted:
-            return citations
+        if not wanted:  # verified PDF quotes, none on a stored page: nothing to read
+            return [_with_highlights(c, sources, {}, set(), versions) for c in citations]
         try:
             rows = (
                 await self._session.execute(
@@ -312,12 +338,13 @@ class AnswerService:
             with contextlib.suppress(SQLAlchemyError, OSError):
                 await self._session.rollback()
             return [
-                _note(c, HIGHLIGHTS_UNAVAILABLE) if _needs_geometry(c) else c for c in citations
+                _note(c, HIGHLIGHTS_UNAVAILABLE) if _located_in(c, versions, "pdf") else c
+                for c in citations
             ]
         geometry: dict[uuid.UUID, list[PageGeometry]] = defaultdict(list)
         stale: set[uuid.UUID] = set()
         for row in rows:
-            if row.processed_at != versions.get(row.document_id):
+            if row.processed_at != versions[row.document_id].processed_at:
                 stale.add(row.document_id)
                 continue
             geometry[row.document_id].append(
@@ -331,7 +358,69 @@ class AnswerService:
                 )
             )
         await self._session.rollback()  # a short read; hold no connection afterwards
-        return [_with_highlights(c, sources, geometry, stale) for c in citations]
+        return [_with_highlights(c, sources, geometry, stale, versions) for c in citations]
+
+    async def _add_block_ranges(
+        self,
+        citations: list[CitationOut],
+        sources: dict[uuid.UUID, SourceDocument],
+        versions: Versions,
+    ) -> list[CitationOut]:
+        """Block ranges for verified Word citations, from only the stored blocks that overlap
+        the verified ranges (the verifier's chosen occurrence, never re-matched). Same
+        safeguards as the PDF rectangles: read after the LLM call, so a document reprocessed
+        meanwhile gets none; a database failure keeps the verified answer."""
+        located = [c for c in citations if _located_in(c, versions, "docx")]
+        if not located:
+            return citations
+        try:
+            rows = (
+                await self._session.execute(
+                    select(
+                        DocumentBlock.document_id,
+                        DocumentBlock.ordinal,
+                        DocumentBlock.kind,
+                        DocumentBlock.char_start,
+                        DocumentBlock.char_end,
+                        Document.processed_at,
+                    )
+                    .join(Document, Document.id == DocumentBlock.document_id)
+                    .where(
+                        or_(
+                            *(
+                                and_(
+                                    DocumentBlock.document_id == c.document_id,
+                                    DocumentBlock.char_start < c.char_end,
+                                    DocumentBlock.char_end > c.char_start,
+                                )
+                                for c in located
+                            )
+                        )
+                    )
+                )
+            ).all()
+        except (SQLAlchemyError, OSError) as exc:
+            logger.warning("Block locations unavailable", extra={"error": type(exc).__name__})
+            with contextlib.suppress(SQLAlchemyError, OSError):
+                await self._session.rollback()
+            return [
+                _note(c, BLOCKS_UNAVAILABLE) if _located_in(c, versions, "docx") else c
+                for c in citations
+            ]
+        blocks: dict[uuid.UUID, dict[int, StoredBlock]] = defaultdict(dict)
+        stale: set[uuid.UUID] = set()
+        for row in rows:
+            if row.processed_at != versions[row.document_id].processed_at:
+                stale.add(row.document_id)
+                continue
+            blocks[row.document_id][row.ordinal] = StoredBlock(
+                row.ordinal, row.kind, row.char_start, row.char_end
+            )
+        await self._session.rollback()  # a short read; hold no connection afterwards
+        return [
+            _with_block_ranges(c, sources, blocks, stale) if _located_in(c, versions, "docx") else c
+            for c in citations
+        ]
 
     def _verify(
         self,
@@ -376,9 +465,16 @@ class AnswerService:
         )
 
 
-def _needs_geometry(citation: CitationOut) -> bool:
-    """A verified quote located on PDF pages (Word documents have no pages)."""
-    return citation.status == "verified" and bool(citation.page_start and citation.page_end)
+def _located_in(citation: CitationOut, versions: Versions, file_type: str) -> bool:
+    """A verified quote in a document of `file_type` (as of the answer's snapshot)."""
+    version = versions.get(citation.document_id) if citation.document_id else None
+    return (
+        citation.status == "verified"
+        and citation.char_start is not None
+        and citation.char_end is not None
+        and version is not None
+        and version.file_type == file_type
+    )
 
 
 def _note(citation: CitationOut, note: str) -> CitationOut:
@@ -392,16 +488,22 @@ def _with_highlights(
     sources: dict[uuid.UUID, SourceDocument],
     geometry: dict[uuid.UUID, list[PageGeometry]],
     stale: set[uuid.UUID],
+    versions: Versions,
 ) -> CitationOut:
-    """The citation with its highlight rectangles, or with a note that it cannot be placed."""
-    if not _needs_geometry(citation):
-        return citation  # unverified, or a Word document (no pages)
-    assert citation.page_start and citation.page_end
+    """The citation with its highlight rectangles, or with a note that it cannot be placed
+    (including a verified PDF quote that falls on no stored page)."""
+    if not _located_in(citation, versions, "pdf"):
+        return citation  # unverified, or a Word document
     assert citation.document_id and citation.char_start is not None
     assert citation.char_end is not None
     boxes = None
     source = sources.get(citation.document_id)
-    if source is not None and citation.document_id not in stale:
+    if (
+        source is not None
+        and citation.document_id not in stale
+        and citation.page_start
+        and citation.page_end
+    ):
         pages = [
             g
             for g in geometry.get(citation.document_id, [])
@@ -423,6 +525,40 @@ def _with_highlights(
         for b in boxes
     ]
     return citation.model_copy(update={"highlights": rects})
+
+
+def _with_block_ranges(
+    citation: CitationOut,
+    sources: dict[uuid.UUID, SourceDocument],
+    blocks: dict[uuid.UUID, dict[int, StoredBlock]],
+    stale: set[uuid.UUID],
+) -> CitationOut:
+    """The Word citation with its block ranges, or with a note that it cannot be placed."""
+    assert citation.document_id and citation.char_start is not None
+    assert citation.char_end is not None
+    spans = None
+    source = sources.get(citation.document_id)
+    if source is not None and citation.document_id not in stale:
+        spans = block_ranges(
+            source.text,
+            citation.char_start,
+            citation.char_end,
+            list(blocks.get(citation.document_id, {}).values()),
+        )
+    if not spans:
+        return _note(citation, BLOCKS_NOT_LOCATED)
+    ranges = [
+        BlockRange(
+            block=s.block,
+            kind=s.kind,
+            block_char_start=s.block_char_start,
+            block_char_end=s.block_char_end,
+            start=s.start,
+            end=s.end,
+        )
+        for s in spans
+    ]
+    return citation.model_copy(update={"block_ranges": ranges})
 
 
 def _location_reason(check: QuoteCheck, cited_evidence_id: str, filename: str) -> str | None:

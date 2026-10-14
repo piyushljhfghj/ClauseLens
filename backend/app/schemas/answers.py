@@ -54,6 +54,17 @@ class HighlightRect(BaseModel):
     y1: float
 
 
+class BlockRange(BaseModel):
+    """The part of a verified quote inside one block of a Word document's extracted text."""
+
+    block: int = Field(description="0-based block number in document order, as stored.")
+    kind: str = Field(description="paragraph, heading or table_row.")
+    block_char_start: int = Field(description="The block's start in the canonical text.")
+    block_char_end: int = Field(description="The block's end in the canonical text.")
+    start: int = Field(description="Where the quote starts within the block's text.")
+    end: int = Field(description="Where the quote ends (exclusive) within the block's text.")
+
+
 class CitationOut(BaseModel):
     n: int = Field(description="Marker number used in the answer text, e.g. [1].")
     status: Literal["verified", "unverified"]
@@ -75,6 +86,16 @@ class CitationOut(BaseModel):
         "quote spans, in displayed-page coordinates (rotation applied, origin top-left). Empty "
         "for unverified quotes, Word documents, or when the stored layout cannot place the quote "
         "reliably (then `reason` says so).",
+    )
+    block_ranges: list[BlockRange] = Field(
+        default_factory=list,
+        description="Verified Word (DOCX) quotes only: the quote's range in each extracted block "
+        "it spans (block text = canonical text [block_char_start, block_char_end); the blank "
+        "line between blocks belongs to neither). Offsets count Unicode code points, like every "
+        "character offset in this API; a JavaScript string index counts UTF-16 units, which "
+        "differ only for characters outside the Basic Multilingual Plane. Empty for unverified "
+        "quotes, PDFs, or when the stored structure cannot place the quote (then `reason` says "
+        "so).",
     )
     occurrence_count: int | None = Field(
         default=None,
