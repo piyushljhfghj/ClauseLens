@@ -10,10 +10,12 @@ document); the reported location is then computed from our stored text.
   passage of that document, then anywhere else; a match outside every passage carries no
   evidence id, so it is never presented as coming from the model's evidence.
 - Whole words: a match may not start or end inside a word or number ("s liability" inside
-  "Supplier's liability", "AED 100" inside "AED 100,000").
+  "Supplier's liability", "AED 100" inside "AED 100,000", "S. law" inside "U.S. law").
+- Repeated text: when the tier the match was found in holds several occurrences, the location
+  is flagged ambiguous with the document-wide occurrence count.
 
-Not yet (later Phase 6 tasks): whitespace-insensitive matching, duplicate ambiguity, highlight
-rectangles. Elided quotes ("...") stay unverified.
+Not yet (later Phase 6 tasks): whitespace-insensitive matching, highlight rectangles. Elided
+quotes ("...") stay unverified.
 """
 
 import re
@@ -62,6 +64,12 @@ class QuoteCheck:
     char_end: int | None = None
     matched_text: str | None = None  # exact canonical text (what the UI shows)
     occurrences: int = 0  # whole-word occurrences in the cited document
+    # Where it was found (the cited passage, the other passages given to the model, or the rest
+    # of the document) it occurs more than once: the location is the first of several equally
+    # plausible ones, not a definitive one.
+    ambiguous: bool = False
+    tier: str | None = None  # "cited" | "other_evidence" | "document"
+    tier_occurrences: int = 0  # occurrences in that tier
 
 
 def clean_quote(quote: str) -> tuple[str, str | None]:
@@ -90,7 +98,9 @@ def _joiner(norm: Normalized, original: str, k: int) -> bool:
     """Whether normalised character k joins the characters on either side into one word:
     an apostrophe ("Supplier's"), a hyphen but not a dash ("non-compete" is one word; an em
     dash between two words is not; both normalise to "-", so the original character decides),
-    or a thousands/decimal separator between digits ("100,000", "8.2")."""
+    a thousands/decimal separator between digits ("100,000", "8.2"), or a full stop between
+    two letters with no space, as in an abbreviation ("U.S.", "A.P.J."); a sentence end is
+    followed by whitespace, so it still separates words."""
     t = norm.text
     if not 0 < k < len(t) - 1:
         return False
@@ -99,7 +109,9 @@ def _joiner(norm: Normalized, original: str, k: int) -> bool:
         return before.isalnum() and after.isalnum()
     if ch == "-":
         return before.isalnum() and after.isalnum() and original[norm.offsets[k]] in _HYPHENS
-    if ch in ",.":
+    if ch == ".":
+        return (before.isdigit() and after.isdigit()) or (before.isalpha() and after.isalpha())
+    if ch == ",":
         return before.isdigit() and after.isdigit()
     return False
 
@@ -158,30 +170,38 @@ def verify_quote(
             )
         return QuoteCheck(False, "The quoted text was not found in the cited document.")
 
-    # Prefer an occurrence inside the cited passage, then inside another passage of the same
-    # document the model was given, then anywhere else in the document; the quote with its edge
-    # quotation marks before the quote without them; then document order.
+    # Tiers: the cited passage, then the other passages of the same document the model was
+    # given, then anywhere else in that document. Within a tier the quote with its edge quotation
+    # marks beats the quote without them. A tier holding several occurrences is ambiguous: the
+    # first is reported (passage order, then document order) and flagged, never as definitive.
     passages = [cited] + [
         e for e in evidence.values() if e.document_id == cited.document_id and e is not cited
     ]
 
-    def tier(start: int, end: int) -> int:
+    def placement(start: int, end: int) -> tuple[int, int]:
+        """(tier, passage index) of a match lying wholly inside a passage, else the document."""
         for index, passage in enumerate(passages):
             if passage.char_start <= start and end <= passage.char_start + len(passage.text):
-                return index
-        return len(passages)
+                return (0 if index == 0 else 1), index
+        return 2, len(passages)
 
-    best = min(
-        (tier(start, end), needle_index, start, end)
+    candidates = list(
+        (*placement(start, end), needle_index, start, end)
         for needle_index, found in enumerate(spans)
         for start, end in found
     )
-    passage_index, needle_index, start, end = best
+    best_tier, passage_index, needle_index, start, end = min(
+        candidates, key=lambda c: (c[0], c[2], c[1], c[3])
+    )
+    rivals = [c for c in candidates if c[0] == best_tier and c[2] == needle_index]
     return QuoteCheck(
         True,
-        evidence_id=passages[passage_index].evidence_id if passage_index < len(passages) else None,
+        evidence_id=passages[passage_index].evidence_id if best_tier < 2 else None,
         char_start=start,
         char_end=end,
         matched_text=source.text[start:end],
         occurrences=len(spans[needle_index]),
+        ambiguous=len(rivals) > 1,
+        tier=("cited", "other_evidence", "document")[best_tier],
+        tier_occurrences=len(rivals),
     )

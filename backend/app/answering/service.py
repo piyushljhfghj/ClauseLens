@@ -38,7 +38,7 @@ from app.schemas.answers import (
 )
 from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
 from app.verification.normalize import normalize
-from app.verification.quotes import EvidenceText, SourceDocument, verify_quote
+from app.verification.quotes import EvidenceText, QuoteCheck, SourceDocument, verify_quote
 
 logger = logging.getLogger(__name__)
 
@@ -267,15 +267,7 @@ class AnswerService:
         records = pages.get(cited.document_id, [])
         page_start = _page_at(records, check.char_start)
         page_end = _page_at(records, check.char_end - 1)
-        if check.evidence_id is None:
-            reason: str | None = (
-                f"Found elsewhere in {cited.document_filename}, outside the passages the model "
-                f"was given (it cited {citation.evidence_id})."
-            )
-        elif check.evidence_id != citation.evidence_id:
-            reason = f"Found in {check.evidence_id}, not in the cited {citation.evidence_id}."
-        else:
-            reason = None
+        reason = _location_reason(check, citation.evidence_id, cited.document_filename)
         return CitationOut(
             status="verified",
             evidence_id=check.evidence_id,
@@ -287,9 +279,34 @@ class AnswerService:
             page_start=page_start,
             page_end=page_end,
             quality=_quote_quality(records, page_start, page_end),
+            occurrence_count=check.occurrences,
+            location_ambiguous=check.ambiguous,
             reason=reason,
             **base,
         )
+
+
+def _location_reason(check: QuoteCheck, cited_evidence_id: str, filename: str) -> str | None:
+    """Where a verified quote was found, when that is not simply (once) in the cited passage."""
+    if check.tier == "document":
+        reason = (
+            f"Found elsewhere in {filename}, outside the passages the model was given (it cited "
+            f"{cited_evidence_id})."
+        )
+        where = "outside those passages"
+    elif check.tier == "other_evidence":
+        reason = f"Found in {check.evidence_id}, not in the cited {cited_evidence_id}."
+        where = "in the other passages the model was given"
+    else:
+        reason = None
+        where = f"in {cited_evidence_id}"
+    if check.ambiguous:
+        repeat = (
+            f"It occurs {check.tier_occurrences} times {where}; the location shown is the first, "
+            "not necessarily the one meant."
+        )
+        reason = f"{reason} {repeat}" if reason else repeat
+    return reason
 
 
 def _page_at(records: list[PageRecord], position: int) -> int | None:

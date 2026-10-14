@@ -57,7 +57,21 @@ class CitationOut(BaseModel):
     page_start: int | None = None
     page_end: int | None = None
     quality: PassageQuality | None = None
-    reason: str | None = Field(default=None, description="Why the citation is unverified.")
+    occurrence_count: int | None = Field(
+        default=None,
+        description="How many times the quote occurs (as whole words) in its document.",
+    )
+    location_ambiguous: bool = Field(
+        default=False,
+        description="The quote occurs more than once where it was found (the cited passage, the "
+        "other passages given to the model, or the rest of the document): the location is the "
+        "first of several equally plausible ones, not a definitive one.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Why the citation is unverified; for a verified one, where it was found when "
+        "that is not simply the cited passage.",
+    )
 
 
 class ExcludedPassage(BaseModel):

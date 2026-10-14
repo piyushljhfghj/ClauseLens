@@ -647,3 +647,53 @@ async def test_partial_word_quote_is_not_verified_end_to_end(
     result = await ask(api, "How can the agreement be terminated?", contract)
     assert result["grounding"] == "ungrounded" and result["answer"] == INSUFFICIENT_ANSWER
     assert "middle of a word" in result["citations"][0]["reason"]
+
+
+# --- repeated occurrences (Phase 6, task 2) -------------------------------------------------------
+
+PRICING_QUOTE = "Pricing applies as set out in the Order Form agreed by the parties."
+
+
+async def test_quote_repeated_outside_the_evidence_is_flagged_ambiguous(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    # Contract A repeats its pricing page (pages 5 and 6); the model is asked about termination,
+    # so neither pricing page is in its evidence.
+    def script(messages: list[ChatMessage]) -> str:
+        evidence = evidence_in(messages)
+        assert not any("Pricing applies" in text for text in evidence.values())
+        e = find(evidence, "terminate this Agreement")
+        return answer_output(
+            "Either party may terminate [1]. Pricing follows the Order Form [2].",
+            [
+                {"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"},
+                {"n": 2, "evidence": e, "quote": PRICING_QUOTE},
+            ],
+        )
+
+    llm.script = script
+    result = await ask(api, "How can the agreement be terminated?", contract)
+    first, second = result["citations"]
+    assert first["occurrence_count"] == 1 and first["location_ambiguous"] is False
+    assert second["status"] == "verified" and second["evidence_id"] is None
+    assert second["occurrence_count"] == 2 and second["location_ambiguous"] is True
+    assert "It occurs 2 times outside those passages" in second["reason"]
+    text = await canonical(contract)
+    assert text[second["char_start"] : second["char_end"]] == PRICING_QUOTE
+    assert second["page_start"] == 5  # the first of the two
+
+
+async def test_unverified_citation_has_no_occurrence_data(
+    api: httpx.AsyncClient, contract: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "terminate this Agreement")
+        return answer_output(
+            "Termination needs 90 days [1].",
+            [{"n": 1, "evidence": e, "quote": "Either party may terminate on ninety days notice"}],
+        )
+
+    llm.script = script
+    citation = (await ask(api, "How can the agreement be terminated?", contract))["citations"][0]
+    assert citation["status"] == "unverified"
+    assert citation["occurrence_count"] is None and citation["location_ambiguous"] is False

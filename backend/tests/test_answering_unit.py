@@ -16,7 +16,13 @@ from app.answering.integrity import (
 )
 from app.answering.parser import parse_output
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
-from app.answering.service import PageRecord, _grounding, _page_at, _quote_quality
+from app.answering.service import (
+    PageRecord,
+    _grounding,
+    _location_reason,
+    _page_at,
+    _quote_quality,
+)
 from app.core.config import Settings
 from app.llm import (
     ChatMessage,
@@ -145,7 +151,7 @@ def test_unknown_evidence_id() -> None:
 
 def test_duplicate_occurrences_are_counted_first_one_located() -> None:
     check = verify("Notice must be given in writing.", "E1", EVIDENCE)
-    assert check.verified and check.occurrences == 2
+    assert check.verified and check.occurrences == 2 and check.ambiguous
     assert (
         SOURCE[check.char_start - 500 : check.char_end - 500] == "Notice must be given in writing."
     )
@@ -727,6 +733,7 @@ def test_repeated_text_outside_the_evidence_uses_the_first_occurrence() -> None:
     text = documents_for(EVIDENCE, {DOC_A: tail})[DOC_A].text
     assert check.verified and check.evidence_id is None and check.occurrences == 2
     assert check.char_start == text.index("Payment is due")
+    assert check.ambiguous  # reported as the first of two, not as definitive
 
 
 def test_text_only_in_another_selected_document_is_never_a_substitute() -> None:
@@ -753,3 +760,149 @@ def test_missing_document_text_is_never_verified() -> None:
 def test_fabricated_quotes_are_not_verified_anywhere_in_the_document(quote: str) -> None:
     check = verify(quote, "E1", extra={DOC_A: OUTSIDE})
     assert not check.verified
+
+
+# --- repeated occurrences and location ambiguity (Phase 6, task 2) ------------------------------
+
+NOTICE = "Notice must be given in writing."  # twice in SOURCE (passage E1)
+PRICING = "Pricing follows the Order Form."
+
+
+def doc_with(*passages: tuple[str, int, str], tail: str = "") -> tuple[dict, dict]:  # type: ignore[type-arg]
+    """Evidence passages of document A (id, offset, text) plus `tail` after them."""
+    evidence = {eid: EvidenceText(eid, DOC_A, start, text) for eid, start, text in passages}
+    return evidence, documents_for(evidence, {DOC_A: tail} if tail else None)
+
+
+def test_repeated_within_the_cited_passage_is_ambiguous() -> None:
+    check = verify(NOTICE, "E1", extra={DOC_A: f"\n\n{NOTICE}"})
+    assert check.verified and check.evidence_id == "E1" and check.tier == "cited"
+    assert check.ambiguous and check.tier_occurrences == 2
+    assert check.occurrences == 3  # the whole document, including the copy outside E1
+    assert check.char_start == 500 + SOURCE.index(NOTICE)  # the first one in E1
+
+
+def test_single_occurrence_in_the_cited_passage_is_definitive_despite_copies_elsewhere() -> None:
+    evidence, documents = doc_with(
+        ("E1", 0, f"1. {PRICING}"), ("E2", 100, f"2. {PRICING}"), tail=f"\n\n3. {PRICING}"
+    )
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    assert check.verified and check.evidence_id == "E1" and not check.ambiguous
+    assert check.occurrences == 3 and check.tier_occurrences == 1
+
+
+def test_one_other_supplied_passage_is_definitive() -> None:
+    evidence, documents = doc_with(
+        ("E1", 0, "1. Unrelated text here."), ("E2", 100, f"2. {PRICING}"), tail=f"\n\n{PRICING}"
+    )
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    assert check.verified and check.evidence_id == "E2" and check.tier == "other_evidence"
+    assert not check.ambiguous and check.occurrences == 2
+
+
+def test_several_other_supplied_passages_are_ambiguous() -> None:
+    evidence, documents = doc_with(
+        ("E1", 0, "1. Unrelated text here."),
+        ("E2", 100, f"2. {PRICING}"),
+        ("E3", 200, f"3. {PRICING}"),
+    )
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    assert check.verified and check.evidence_id == "E2"  # first in the order shown to the model
+    assert check.ambiguous and check.tier_occurrences == 2 and check.occurrences == 2
+
+
+def test_repeated_elsewhere_in_the_document_is_ambiguous() -> None:
+    tail = f"\n\nA. {PRICING}\n\nB. {PRICING}"
+    evidence, documents = doc_with(("E1", 0, "1. Unrelated text here."), tail=tail)
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    text = documents[DOC_A].text
+    assert check.verified and check.evidence_id is None and check.tier == "document"
+    assert check.ambiguous and check.tier_occurrences == check.occurrences == 2
+    assert check.char_start == text.index(PRICING)
+
+
+def test_single_occurrence_elsewhere_is_not_ambiguous() -> None:
+    evidence, documents = doc_with(("E1", 0, "1. Unrelated text here."), tail=f"\n\nA. {PRICING}")
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    assert check.verified and check.tier == "document" and not check.ambiguous
+
+
+def test_copies_in_another_document_never_count_or_attribute() -> None:
+    # Document B has the sentence in a passage at overlapping offsets and in its text; A has it
+    # once outside its evidence.
+    evidence = {
+        "E1": EvidenceText("E1", DOC_A, 0, "1. Unrelated text here."),
+        "E2": EvidenceText("E2", DOC_B, 0, f"{PRICING} {PRICING}"),
+    }
+    documents = documents_for(evidence, {DOC_A: f"\n\n{PRICING}", DOC_B: f"\n\n{PRICING}"})
+    check = verify_quote(PRICING, "E1", evidence, documents)
+    assert check.verified and check.evidence_id is None and check.tier == "document"
+    assert check.occurrences == 1 and not check.ambiguous
+    assert documents[DOC_A].text[check.char_start : check.char_end] == PRICING
+
+
+def test_edge_quotation_marks_are_preferred_within_a_tier() -> None:
+    passage = f"A {LDQUO}Term Sheet{RDQUO} is signed. The Term Sheet binds."
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, passage)}
+    check = verify(f"{LDQUO}Term Sheet{RDQUO} is signed", "E1", evidence)
+    assert check.matched_text == f"{LDQUO}Term Sheet{RDQUO} is signed" and not check.ambiguous
+
+
+ABBREVIATIONS = (
+    "Governed by U.S. law applies here. Signed by Dr. A.P.J. Abdul Kalam today. "
+    "Some events, e.g. a breach, count. The fee is several. The fee is due."
+)
+
+
+@pytest.mark.parametrize(
+    "quote",
+    ["S. law applies here", "J. Abdul Kalam today", "P.J. Abdul Kalam", "g. a breach, count"],
+)
+def test_quote_starting_inside_an_abbreviation_is_rejected(quote: str) -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, ABBREVIATIONS)}
+    check = verify(quote, "E1", evidence)
+    assert not check.verified and "middle of a word" in (check.reason or "")
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "U.S. law applies here",
+        "Governed by U.S. law",
+        "Dr. A.P.J. Abdul Kalam",
+        "e.g. a breach, count",
+        "is several. The fee is due",  # a sentence boundary still separates words
+        "The fee is due.",
+    ],
+)
+def test_whole_abbreviations_and_sentence_boundaries_are_accepted(quote: str) -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, ABBREVIATIONS)}
+    check = verify(quote, "E1", evidence)
+    assert check.verified and check.matched_text == quote
+
+
+def test_quote_ending_inside_an_abbreviation_is_rejected() -> None:
+    evidence = {"E1": EvidenceText("E1", DOC_A, 0, ABBREVIATIONS)}
+    check = verify("Governed by U.", "E1", evidence)
+    assert not check.verified and "middle of a word" in (check.reason or "")
+
+
+def location(
+    tier: str, ambiguous: bool = False, n: int = 1, evidence_id: str | None = None
+) -> QuoteCheck:
+    return QuoteCheck(
+        True, evidence_id=evidence_id, ambiguous=ambiguous, tier=tier, tier_occurrences=n
+    )
+
+
+def test_location_reasons() -> None:
+    assert _location_reason(location("cited", evidence_id="E1"), "E1", "a.pdf") is None
+    assert _location_reason(location("cited", True, 2, "E1"), "E1", "a.pdf") == (
+        "It occurs 2 times in E1; the location shown is the first, not necessarily the one meant."
+    )
+    assert _location_reason(location("other_evidence", evidence_id="E2"), "E1", "a.pdf") == (
+        "Found in E2, not in the cited E1."
+    )
+    reason = _location_reason(location("document", True, 3), "E1", "a.pdf") or ""
+    assert reason.startswith("Found elsewhere in a.pdf, outside the passages the model was given")
+    assert "It occurs 3 times outside those passages" in reason
