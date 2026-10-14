@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import documents, health
+from app.api.routes import documents, health, retrieval
 from app.core.config import APP_VERSION, Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
@@ -87,6 +87,7 @@ def create_app(settings: Settings | None = None, *, embedder: Embedder | None = 
     register_exception_handlers(app)
     app.include_router(health.router)
     app.include_router(documents.router)
+    app.include_router(retrieval.router)
 
     @app.get("/", include_in_schema=False)
     async def root() -> dict[str, str]:

@@ -142,6 +142,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/retrieval/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Hybrid search (semantic + BM25 + phrase + clause reference) over selected documents */
+        post: operations["search_api_retrieval_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -168,6 +185,27 @@ export interface components {
              * @description Version info, or the reason a check failed.
              */
             detail?: string | null;
+        };
+        /**
+         * DocumentCoverage
+         * @description What the search covered in one document, including what extraction could not read.
+         */
+        DocumentCoverage: {
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Filename */
+            filename: string;
+            /** Chunks Searched */
+            chunks_searched: number;
+            /** Page Count */
+            page_count: number | null;
+            /** Unreadable Page Count */
+            unreadable_page_count: number | null;
+            /** Low Quality Page Count */
+            low_quality_page_count: number | null;
         };
         /** DocumentList */
         DocumentList: {
@@ -359,6 +397,133 @@ export interface components {
             ocr_confidence: number | null;
             /** Char Count */
             char_count: number;
+        };
+        /**
+         * PassageQuality
+         * @description How the passage's pages were read. Low-quality OCR text is retrievable but unreliable;
+         *     downstream answers and citations must treat it accordingly.
+         */
+        PassageQuality: {
+            /**
+             * Level
+             * @description Worst extraction quality among the passage's pages; not_applicable for DOCX.
+             * @enum {string}
+             */
+            level: "text" | "ocr" | "low_quality_ocr" | "not_applicable";
+            /** Ocr Pages */
+            ocr_pages?: number[];
+            /** Low Quality Pages */
+            low_quality_pages?: number[];
+            /** Min Ocr Confidence */
+            min_ocr_confidence?: number | null;
+        };
+        /** QueryAnalysisOut */
+        QueryAnalysisOut: {
+            /** Terms */
+            terms: string[];
+            /** Phrases */
+            phrases: string[];
+            /** Section Refs */
+            section_refs: string[];
+        };
+        /** RetrievalRequest */
+        RetrievalRequest: {
+            /**
+             * Query
+             * @description Natural-language question or keywords.
+             */
+            query: string;
+            /**
+             * Document Ids
+             * @description Documents to search (the selected document or documents).
+             */
+            document_ids: string[];
+            /**
+             * Top K
+             * @description Passages to return.
+             */
+            top_k?: number | null;
+        };
+        /** RetrievalResponse */
+        RetrievalResponse: {
+            /** Query */
+            query: string;
+            /** Passages */
+            passages: components["schemas"]["RetrievedPassage"][];
+            /**
+             * No Match
+             * @description True when nothing in the documents matched the query.
+             */
+            no_match: boolean;
+            /** Coverage */
+            coverage: components["schemas"]["DocumentCoverage"][];
+            analysis: components["schemas"]["QueryAnalysisOut"];
+            /**
+             * Notes
+             * @description Caveats, e.g. no searchable terms, duplicates removed, unreadable pages.
+             */
+            notes?: string[];
+        };
+        /**
+         * RetrievalSignals
+         * @description Why a passage was retrieved. Ranks are 1-based within (retriever, document).
+         */
+        RetrievalSignals: {
+            /** Dense Rank */
+            dense_rank?: number | null;
+            /**
+             * Dense Similarity
+             * @description Cosine similarity.
+             */
+            dense_similarity?: number | null;
+            /** Bm25 Rank */
+            bm25_rank?: number | null;
+            /** Bm25 Score */
+            bm25_score?: number | null;
+            /** Phrase Rank */
+            phrase_rank?: number | null;
+            /** Section Rank */
+            section_rank?: number | null;
+        };
+        /** RetrievedPassage */
+        RetrievedPassage: {
+            /** Rank */
+            rank: number;
+            /**
+             * Score
+             * @description Reciprocal Rank Fusion score (relative, not a probability).
+             */
+            score: number;
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Document Filename */
+            document_filename: string;
+            /** Chunk Id */
+            chunk_id: number;
+            /** Chunk Ordinal */
+            chunk_ordinal: number;
+            /** Section Id */
+            section_id: number | null;
+            /** Section Path */
+            section_path: string;
+            /** Char Start */
+            char_start: number;
+            /** Char End */
+            char_end: number;
+            /** Page Start */
+            page_start: number | null;
+            /** Page End */
+            page_end: number | null;
+            /**
+             * Text
+             * @description Exact canonical text of the passage (never modified).
+             */
+            text: string;
+            signals: components["schemas"]["RetrievalSignals"];
+            quality: components["schemas"]["PassageQuality"];
         };
         /** SectionOut */
         SectionOut: {
@@ -757,6 +922,51 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    search_api_retrieval_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetrievalRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetrievalResponse"];
+                };
+            };
+            /** @description A selected document does not exist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A selected document is not indexed with the current pipeline */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid query, too many documents or top_k too large */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

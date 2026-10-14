@@ -75,6 +75,7 @@ citation) is a `[char_start, char_end)` range into it.
 | `POST /api/documents` (multipart, magic-byte validation) · `GET /api/documents[/{id}]` · `DELETE` · `GET /{id}/file` · `POST /{id}/reprocess` | 2 ✅ |
 | `GET /api/documents/{id}/outline` (section tree) · `/{id}/pages` (per-page extraction status) | 3 ✅ |
 | `GET /api/documents/{id}/layout` (word boxes / blocks for the viewer) | 7 |
+| `POST /api/retrieval/search` `{query, document_ids[], top_k?}` → ranked passages + coverage | 4 ✅ |
 | `POST /api/chats` · `GET /api/chats?document_id=` · `GET/DELETE /api/chats/{id}` | 8 |
 | `POST /api/chats/{id}/messages` → SSE · `POST /api/chats/{id}/messages/{mid}/stop` | 5–8 |
 | `POST /api/comparisons` · `GET /api/comparisons/{id}?type=&significance=&sort=` | 11 |
@@ -162,6 +163,38 @@ TypeScript types are generated from the OpenAPI schema (`npm run gen:api`).
    A failed re-index leaves the previous complete index untouched.
 
 ## 6. Retrieval and generation (Phases 4–5, 9–10)
+
+**Implemented in Phase 4 ✅ (`app/retrieval/`)** — no migration; uses the Phase 3 columns.
+
+- *Query analysis* (`query.py`, deterministic): BM25 terms from the same tokenizer as the index
+  minus a short stopword list (legal words such as "shall", "not", "any" are kept), "quoted"
+  phrases, clause references (`clause 8.2`, `Article IV` → `article 4`, `Schedule 2`, bare
+  `8.2`). A query with no searchable content returns no passages rather than arbitrary ones.
+- *Candidates* (`candidates.py`), each one SQL statement over the selected documents only,
+  ranked **per document** (window functions), ties broken by chunk ordinal:
+  dense — pgvector cosine, exact scan, top 30, semantic-only hits below
+  `RETRIEVAL_MIN_DENSE_SIMILARITY` (0.55) dropped; BM25 — computed in SQL from the stored
+  `lexical_tokens` with per-document N/avgdl/df (k1 = 1.2, b = 0.75), only chunks containing a
+  query term are unnested; phrase — whitespace/punctuation-insensitive regex on `context_text`
+  (thousands separators optional); section — chunks overlapping a section whose
+  `number_normalized` matches a clause reference.
+- *Fusion* (`fusion.py`): Reciprocal Rank Fusion, k = 60 (ranks only; raw BM25 and cosine
+  scores are never added). Order: RRF score, number of agreeing retrievers, best rank, document
+  id, ordinal. Then near-duplicates (identical, or ≥ 90 % word overlap) *within the same
+  document* are dropped; identical clauses in different documents are kept.
+- *Integrity* (`service.py`): all reads in one read-only REPEATABLE READ snapshot; documents
+  must be `ready`, at the current `INDEX_VERSION` and embedded with the running model, else
+  409 `DOCUMENT_NOT_INDEXED`. Passages return the canonical `text` (== canonical slice),
+  `char_start/char_end`, pages, section, the per-retriever ranks/scores, and extraction
+  `quality` (text / ocr / low_quality_ocr / not_applicable, with page lists); the response adds
+  per-document coverage (chunks searched, unreadable and low-quality page counts) and notes.
+- Measured: bge-small-en-v1.5 *without* the BGE query instruction separated related from
+  unrelated query/passage pairs better (0.62–0.74 vs ≤ 0.51) than with it (0.58–0.70 vs ≤ 0.50),
+  so queries are embedded without the instruction.
+- Not yet: cross-encoder reranking, token-budgeted context selection and per-document quotas
+  for answering (Phase 5/10), absence/exhaustive-question widening (Phase 9).
+
+Target design (full pipeline):
 
 question → deterministic query analysis (section references, quoted phrases, amounts, absence /
 exhaustive intent) → per document BM25 top-30 ∥ dense top-30 (+ direct section fetch) → RRF

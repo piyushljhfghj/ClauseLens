@@ -39,3 +39,37 @@ class FakeEmbedder:
 
     def embed_query(self, text: str) -> np.ndarray:
         return self._vector(text)
+
+
+# Synonym groups standing in for meaning: texts sharing a concept get similar vectors, texts
+# sharing none are near-orthogonal. Deterministic, so paraphrase retrieval can be tested exactly.
+CONCEPTS: tuple[frozenset[str], ...] = (
+    frozenset({"terminate", "terminated", "termination", "end", "ended", "ending", "cancel",
+               "cancelled", "cancellation", "early", "exit"}),
+    frozenset({"liability", "liable", "damages", "cap", "capped", "exceed", "losses", "owe"}),
+    frozenset({"law", "laws", "governed", "governing", "jurisdiction", "country", "courts"}),
+    frozenset({"confidential", "confidentiality", "secret", "secrets", "disclose", "share"}),
+    frozenset({"payment", "payable", "pay", "invoice", "invoices", "bills", "fees", "fee"}),
+)  # fmt: skip
+_CONCEPT_WEIGHT = 1.0
+_WORD_WEIGHT = 0.08  # every other word adds a little hashed noise, so no vector is all-zero
+
+
+class ConceptEmbedder(FakeEmbedder):
+    model_name = "concept-embedder"
+
+    def _vector(self, text: str) -> np.ndarray:
+        vector = np.zeros(self.dimension, dtype=np.float32)
+        for word in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split():
+            hit = False
+            for index, concept in enumerate(CONCEPTS):
+                if word in concept:
+                    vector[index] += _CONCEPT_WEIGHT
+                    hit = True
+            if not hit:
+                slot = len(CONCEPTS) + int(hashlib.sha256(word.encode()).hexdigest(), 16) % (
+                    self.dimension - len(CONCEPTS)
+                )
+                vector[slot] += _WORD_WEIGHT
+        norm = np.linalg.norm(vector)
+        return vector / norm if norm else vector

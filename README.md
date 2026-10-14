@@ -4,7 +4,7 @@
 answers backed by quotations that the backend has located in the document text before they are
 shown, so an invented quote is never presented as genuine.
 
-> **Project status: Phase 3 of 15 (extraction, OCR, structure, chunking, embeddings).** What exists today is listed under
+> **Project status: Phase 4 of 15 (hybrid retrieval).** What exists today is listed under
 > [What works](#what-works-today). Features described in the architecture doc are planned, not
 > implemented, until they appear in that list.
 
@@ -49,7 +49,11 @@ shown, so an invented quote is never presented as genuine.
       uploaded before Phase 3) with Reprocess / Reprocess all; coverage summary, per-page
       extraction strip, warnings and detected structure on the document page
 - [x] Reprocessing replaces a document's whole index in one transaction (never half-built)
-- [ ] Chat, retrieval, verified quotes, highlighting, comparison, research agent — Phases 4–12
+- [x] **Hybrid retrieval** (`POST /api/retrieval/search`): semantic (pgvector) + BM25 (in SQL) +
+      exact "phrase" + clause-number lookup, fused with Reciprocal Rank Fusion; scoped to the
+      selected document(s); deterministic; near-duplicates removed; off-topic or empty queries
+      return nothing; each passage carries its exact source location and OCR quality
+- [ ] Answers with verified quotes, highlighting, chat, comparison, research agent — Phases 5–12
 
 ### Known limitations (extraction)
 
@@ -124,6 +128,7 @@ Backend (`backend/.env`, see `backend/.env.example`):
 | `OCR_ENABLED` / `OCR_LANGUAGE` / `OCR_DPI` / `TESSERACT_CMD` | OCR of scanned pages (Tesseract) |
 | `EMBEDDING_MODEL` / `EMBEDDING_CACHE_DIR` / `EMBEDDING_BATCH_SIZE` | Local embedding model (only `BAAI/bge-small-en-v1.5`, 384-dim, is supported) |
 | `WORKER_ENABLED` / `JOB_MAX_ATTEMPTS` | In-process background worker; retries for unexpected errors |
+| `RETRIEVAL_*` | Candidates per retriever (30), default/max `top_k` (10/50), RRF k (60), minimum semantic similarity (0.55), BM25 k1/b, query length and document limits |
 | `RUN_MIGRATIONS_ON_START` | Container runs `alembic upgrade head` before starting (default `true` in the image) |
 
 Frontend (`frontend/.env.local`): `NEXT_PUBLIC_API_BASE_URL` — baked in at build time.

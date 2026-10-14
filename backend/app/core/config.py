@@ -74,6 +74,23 @@ class Settings(BaseSettings):
     embedding_cache_dir: str = ".cache/fastembed"
     embedding_batch_size: int = Field(default=32, ge=1, le=256)
 
+    # --- Retrieval ------------------------------------------------------------------------------
+    # Candidates taken from each retriever (dense, BM25, phrase, section) per document.
+    retrieval_candidates_per_list: int = Field(default=30, ge=1, le=200)
+    retrieval_default_top_k: int = Field(default=10, ge=1, le=50)
+    retrieval_max_top_k: int = Field(default=50, ge=1, le=200)
+    retrieval_max_documents: int = Field(default=10, ge=1, le=50)
+    retrieval_max_query_chars: int = Field(default=1000, ge=10, le=10000)
+    # Reciprocal Rank Fusion constant (Cormack et al. 2009): 60 is the standard choice.
+    retrieval_rrf_k: int = Field(default=60, ge=1)
+    # Semantic-only hits below this cosine similarity are dropped, so an off-topic query returns
+    # nothing instead of the "least unrelated" chunks. Calibrated for bge-small-en-v1.5: related
+    # query/passage pairs measured 0.62-0.74, unrelated 0.38-0.51.
+    retrieval_min_dense_similarity: float = Field(default=0.55, ge=-1.0, le=1.0)
+    # BM25 parameters (standard values).
+    retrieval_bm25_k1: float = Field(default=1.2, gt=0)
+    retrieval_bm25_b: float = Field(default=0.75, ge=0, le=1)
+
     # --- Background jobs -----------------------------------------------------------------------
     # The worker runs inside the API process. Tests disable it and drive jobs explicitly.
     worker_enabled: bool = True
