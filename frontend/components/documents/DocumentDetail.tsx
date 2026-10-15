@@ -8,6 +8,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { DocumentDetailSkeleton } from "@/components/documents/DocumentDetailSkeleton";
 import { DocxViewer, type DocxTarget } from "@/components/documents/DocxViewer";
+import { PdfViewer, type PdfTarget } from "@/components/documents/PdfViewer";
 import { IndexPanel } from "@/components/documents/IndexPanel";
 import { OutlinePanel } from "@/components/documents/OutlinePanel";
 import { StatusBadge } from "@/components/library/StatusBadge";
@@ -17,6 +18,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ApiError } from "@/lib/api/client";
 import { documentFileUrl, getDocument } from "@/lib/api/documents";
 import { parseOffsetParam } from "@/lib/citations";
+import { parsePageParam } from "@/lib/pdfHighlights";
 import { coverageSummary, describePages, formatBytes, formatDateTime, isInFlight } from "@/lib/documents";
 
 export function DocumentDetail({ id }: { id: string }) {
@@ -27,7 +29,7 @@ export function DocumentDetail({ id }: { id: string }) {
     refetchInterval: (q) => (q.state.data && isInFlight(q.state.data.status) ? 1_500 : false),
   });
   const actions = useDocumentActions({ onDeleted: () => router.push("/") });
-  const linkTarget = useLinkTarget();
+  const linkTarget = useLinkTargets();
 
   const backLink = (
     <Link href="/" className={buttonClass("ghost", "-ml-2 self-start")}>
@@ -146,6 +148,13 @@ export function DocumentDetail({ id }: { id: string }) {
               ? "The document will be available here once processing finishes."
               : "Processing failed, so the document isn't available for analysis. You can still download the original."}
           </div>
+        ) : document.file_type === "pdf" && document.indexed ? (
+          <PdfViewer
+            documentId={document.id}
+            processedAt={document.processed_at}
+            fileUrl={documentFileUrl(document.id)}
+            target={linkTarget.pdf}
+          />
         ) : document.file_type === "pdf" ? (
           <iframe
             title={`Preview of ${document.filename}`}
@@ -153,7 +162,7 @@ export function DocumentDetail({ id }: { id: string }) {
             className="min-h-[70vh] w-full flex-1 rounded-xl border border-zinc-200 bg-white dark:border-zinc-800"
           />
         ) : document.indexed ? (
-          <DocxViewer documentId={document.id} processedAt={document.processed_at} target={linkTarget} />
+          <DocxViewer documentId={document.id} processedAt={document.processed_at} target={linkTarget.docx} />
         ) : (
           <div className="rounded-xl border border-zinc-200 bg-white px-4 py-12 text-center text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             The text of this Word document isn&apos;t available until it is reprocessed. Use <span className="font-medium">Download</span> to open the original.
@@ -188,16 +197,22 @@ export function DocumentDetail({ id }: { id: string }) {
 }
 
 /**
- * A preview highlight from the page URL (`?cs=<start>&ce=<end>`, canonical code-point offsets),
- * until citations can be opened from answers. It is only ever shown as a link preview, never as a
- * verified citation, and malformed values are ignored.
+ * Preview targets from the page URL, until citations can be opened from answers. They are only
+ * ever shown as link previews, never as verified citations, and malformed values are ignored:
+ * - Word: `?cs=<start>&ce=<end>` (canonical code-point offsets);
+ * - PDF: `?page=<n>` and/or `?hl=<page>:<x0>,<y0>,<x1>,<y1>;...` (PDF points).
  */
-function useLinkTarget(): DocxTarget | undefined {
+function useLinkTargets(): { docx?: DocxTarget; pdf?: PdfTarget } {
   const params = useSearchParams();
   const start = parseOffsetParam(params.get("cs"));
   const end = parseOffsetParam(params.get("ce"));
+  const page = parsePageParam(params.get("page"));
+  const highlights = params.get("hl");
   return useMemo(
-    () => (start !== null && end !== null ? { kind: "link", start, end } : undefined),
-    [start, end],
+    () => ({
+      docx: start !== null && end !== null ? { kind: "link", start, end } : undefined,
+      pdf: page !== null || highlights ? { kind: "link", page, highlights: highlights || null } : undefined,
+    }),
+    [start, end, page, highlights],
   );
 }
