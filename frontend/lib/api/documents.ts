@@ -42,6 +42,17 @@ export async function getPages(id: string, signal?: AbortSignal): Promise<PageOu
   return body.pages;
 }
 
+export type DocumentLayout = components["schemas"]["DocumentLayout"];
+
+/** The extracted text as stored blocks, in document order: what the Word viewer renders and
+ * what citation `block_ranges` refer to. */
+export function getLayout(id: string, signal?: AbortSignal): Promise<DocumentLayout> {
+  return apiRequest<DocumentLayout>(`/api/documents/${encodeURIComponent(id)}/layout`, {
+    signal,
+    timeoutMs: 30_000,
+  });
+}
+
 export function documentFileUrl(id: string, { download = false } = {}): string {
   const url = `${API_BASE_URL}/api/documents/${encodeURIComponent(id)}/file`;
   return download ? `${url}?download=true` : url;

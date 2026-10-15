@@ -1,11 +1,13 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { AlertCircle, AlertTriangle, ArrowLeft, Download, FileText, RotateCcw, Trash2 } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { DocumentDetailSkeleton } from "@/components/documents/DocumentDetailSkeleton";
+import { DocxViewer, type DocxTarget } from "@/components/documents/DocxViewer";
 import { IndexPanel } from "@/components/documents/IndexPanel";
 import { OutlinePanel } from "@/components/documents/OutlinePanel";
 import { StatusBadge } from "@/components/library/StatusBadge";
@@ -14,6 +16,7 @@ import { buttonClass } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { ApiError } from "@/lib/api/client";
 import { documentFileUrl, getDocument } from "@/lib/api/documents";
+import { parseOffsetParam } from "@/lib/citations";
 import { coverageSummary, describePages, formatBytes, formatDateTime, isInFlight } from "@/lib/documents";
 
 export function DocumentDetail({ id }: { id: string }) {
@@ -24,6 +27,7 @@ export function DocumentDetail({ id }: { id: string }) {
     refetchInterval: (q) => (q.state.data && isInFlight(q.state.data.status) ? 1_500 : false),
   });
   const actions = useDocumentActions({ onDeleted: () => router.push("/") });
+  const linkTarget = useLinkTarget();
 
   const backLink = (
     <Link href="/" className={buttonClass("ghost", "-ml-2 self-start")}>
@@ -148,9 +152,11 @@ export function DocumentDetail({ id }: { id: string }) {
             src={documentFileUrl(document.id)}
             className="min-h-[70vh] w-full flex-1 rounded-xl border border-zinc-200 bg-white dark:border-zinc-800"
           />
+        ) : document.indexed ? (
+          <DocxViewer documentId={document.id} processedAt={document.processed_at} target={linkTarget} />
         ) : (
           <div className="rounded-xl border border-zinc-200 bg-white px-4 py-12 text-center text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
-            In-app preview isn&apos;t available for Word documents yet. Use <span className="font-medium">Download</span> to open the original.
+            The text of this Word document isn&apos;t available until it is reprocessed. Use <span className="font-medium">Download</span> to open the original.
           </div>
         )}
       </section>
@@ -178,5 +184,20 @@ export function DocumentDetail({ id }: { id: string }) {
         onCancel={actions.cancelDelete}
       />
     </main>
+  );
+}
+
+/**
+ * A preview highlight from the page URL (`?cs=<start>&ce=<end>`, canonical code-point offsets),
+ * until citations can be opened from answers. It is only ever shown as a link preview, never as a
+ * verified citation, and malformed values are ignored.
+ */
+function useLinkTarget(): DocxTarget | undefined {
+  const params = useSearchParams();
+  const start = parseOffsetParam(params.get("cs"));
+  const end = parseOffsetParam(params.get("ce"));
+  return useMemo(
+    () => (start !== null && end !== null ? { kind: "link", start, end } : undefined),
+    [start, end],
   );
 }

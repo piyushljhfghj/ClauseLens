@@ -108,6 +108,31 @@ class DocumentPages(BaseModel):
     pages: list[PageOut]
 
 
+class LayoutBlock(BaseModel):
+    """One stored block of extracted text: a paragraph, heading or table row."""
+
+    ordinal: int = Field(description="0-based block number in document order.")
+    kind: str = Field(description="paragraph, heading or table_row.")
+    char_start: int = Field(description="The block's start in the canonical text.")
+    char_end: int = Field(description="The block's end (exclusive) in the canonical text.")
+    text: str = Field(
+        description="The block's text: canonical text [char_start, char_end). Offsets count "
+        "Unicode code points (a manual line break, or a break between the cells of a table "
+        "row, is a newline inside the text)."
+    )
+
+
+class DocumentLayout(BaseModel):
+    """A document's extracted text as stored blocks, for rendering and citation highlighting."""
+
+    document_id: uuid.UUID
+    file_type: str
+    processed_at: datetime | None = Field(
+        description="When this index was built; citation offsets refer to this version."
+    )
+    blocks: list[LayoutBlock]
+
+
 class DocumentList(BaseModel):
     items: list[DocumentOut]
     total: int

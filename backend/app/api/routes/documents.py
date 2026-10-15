@@ -9,10 +9,12 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.session import get_session
 from app.schemas.documents import (
+    DocumentLayout,
     DocumentList,
     DocumentOut,
     DocumentOutline,
     DocumentPages,
+    LayoutBlock,
     PageOut,
     SectionOut,
 )
@@ -116,6 +118,22 @@ async def get_document_outline(document_id: uuid.UUID, service: Service) -> Docu
 async def get_document_pages(document_id: uuid.UUID, service: Service) -> DocumentPages:
     pages = await service.pages(document_id)
     return DocumentPages(document_id=document_id, pages=[PageOut(**p) for p in pages])
+
+
+@router.get(
+    "/{document_id}/layout",
+    response_model=DocumentLayout,
+    summary="Extracted text as stored blocks, in document order (for the viewer)",
+    responses={409: {"description": "Document not indexed yet"}},
+)
+async def get_document_layout(document_id: uuid.UUID, service: Service) -> DocumentLayout:
+    document, blocks = await service.layout(document_id)
+    return DocumentLayout(
+        document_id=document.id,
+        file_type=document.file_type,
+        processed_at=document.processed_at,
+        blocks=[LayoutBlock(**b) for b in blocks],  # type: ignore[arg-type]
+    )
 
 
 @router.get(

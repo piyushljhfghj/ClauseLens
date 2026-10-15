@@ -108,6 +108,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/documents/{document_id}/layout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Extracted text as stored blocks, in document order (for the viewer) */
+        get: operations["get_document_layout_api_documents__document_id__layout_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/documents/{document_id}/file": {
         parameters: {
             query?: never;
@@ -375,6 +392,26 @@ export interface components {
             /** Low Quality Page Count */
             low_quality_page_count: number | null;
         };
+        /**
+         * DocumentLayout
+         * @description A document's extracted text as stored blocks, for rendering and citation highlighting.
+         */
+        DocumentLayout: {
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** File Type */
+            file_type: string;
+            /**
+             * Processed At
+             * @description When this index was built; citation offsets refer to this version.
+             */
+            processed_at: string | null;
+            /** Blocks */
+            blocks: components["schemas"]["LayoutBlock"][];
+        };
         /** DocumentList */
         DocumentList: {
             /** Items */
@@ -614,6 +651,37 @@ export interface components {
             x1: number;
             /** Y1 */
             y1: number;
+        };
+        /**
+         * LayoutBlock
+         * @description One stored block of extracted text: a paragraph, heading or table row.
+         */
+        LayoutBlock: {
+            /**
+             * Ordinal
+             * @description 0-based block number in document order.
+             */
+            ordinal: number;
+            /**
+             * Kind
+             * @description paragraph, heading or table_row.
+             */
+            kind: string;
+            /**
+             * Char Start
+             * @description The block's start in the canonical text.
+             */
+            char_start: number;
+            /**
+             * Char End
+             * @description The block's end (exclusive) in the canonical text.
+             */
+            char_end: number;
+            /**
+             * Text
+             * @description The block's text: canonical text [char_start, char_end). Offsets count Unicode code points (a manual line break, or a break between the cells of a table row, is a newline inside the text).
+             */
+            text: string;
         };
         /** LivenessResponse */
         LivenessResponse: {
@@ -1088,6 +1156,44 @@ export interface operations {
                 };
                 content: {
                     "application/json; charset=utf-8": components["schemas"]["DocumentPages"];
+                };
+            };
+            /** @description Document not indexed yet */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_document_layout_api_documents__document_id__layout_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                document_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json; charset=utf-8": components["schemas"]["DocumentLayout"];
                 };
             };
             /** @description Document not indexed yet */

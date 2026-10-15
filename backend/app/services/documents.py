@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import AppError, ConflictError, NotFoundError, ServiceUnavailableError
-from app.db.models import Document, DocumentPage, DocumentSection, DocumentText
+from app.db.models import Document, DocumentBlock, DocumentPage, DocumentSection, DocumentText
 from app.ingestion.detect import detect_file_type, sanitize_filename
 from app.ingestion.pipeline import INDEX_VERSION
 from app.ingestion.structure import section_preview
@@ -221,6 +221,33 @@ class DocumentService:
             .order_by(DocumentPage.page_number)
         )
         return [dict(row._mapping) for row in rows]
+
+    async def layout(self, document_id: uuid.UUID) -> tuple[Document, list[dict[str, object]]]:
+        """Stored blocks in document order with their text (no word boxes). Read in one
+        read-only snapshot, so blocks, text and `processed_at` always belong together even if
+        the document is being re-indexed."""
+        await self._session.connection(
+            execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+        )
+        document = await self._get_indexed(document_id)
+        text = await self._session.scalar(
+            select(DocumentText.canonical_text).where(DocumentText.document_id == document_id)
+        )
+        rows = await self._session.execute(
+            select(
+                DocumentBlock.ordinal,
+                DocumentBlock.kind,
+                DocumentBlock.char_start,
+                DocumentBlock.char_end,
+            )
+            .where(DocumentBlock.document_id == document_id)
+            .order_by(DocumentBlock.ordinal)
+        )
+        canonical = text or ""
+        blocks = [
+            {**row._mapping, "text": canonical[row.char_start : row.char_end]} for row in rows
+        ]
+        return document, blocks
 
     async def _delete_file_quietly(self, key: str) -> None:
         try:
