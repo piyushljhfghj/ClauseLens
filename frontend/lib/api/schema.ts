@@ -229,6 +229,42 @@ export interface components {
                 [key: string]: number;
             };
         };
+        /**
+         * BlockRange
+         * @description The part of a verified quote inside one block of a Word document's extracted text.
+         */
+        BlockRange: {
+            /**
+             * Block
+             * @description 0-based block number in document order, as stored.
+             */
+            block: number;
+            /**
+             * Kind
+             * @description paragraph, heading or table_row.
+             */
+            kind: string;
+            /**
+             * Block Char Start
+             * @description The block's start in the canonical text.
+             */
+            block_char_start: number;
+            /**
+             * Block Char End
+             * @description The block's end in the canonical text.
+             */
+            block_char_end: number;
+            /**
+             * Start
+             * @description Where the quote starts within the block's text.
+             */
+            start: number;
+            /**
+             * End
+             * @description Where the quote ends (exclusive) within the block's text.
+             */
+            end: number;
+        };
         /** Body_upload_document_api_documents_post */
         Body_upload_document_api_documents_post: {
             /**
@@ -277,8 +313,29 @@ export interface components {
             page_end?: number | null;
             quality?: components["schemas"]["PassageQuality"] | null;
             /**
+             * Highlights
+             * @description Verified PDF quotes only: one rectangle per text line, on every page the quote spans, in displayed-page coordinates (rotation applied, origin top-left). Empty for unverified quotes, Word documents, or when the stored layout cannot place the quote reliably (then `reason` says so).
+             */
+            highlights?: components["schemas"]["HighlightRect"][];
+            /**
+             * Block Ranges
+             * @description Verified Word (DOCX) quotes only: the quote's range in each extracted block it spans (block text = canonical text [block_char_start, block_char_end); the blank line between blocks belongs to neither). Offsets count Unicode code points, like every character offset in this API; a JavaScript string index counts UTF-16 units, which differ only for characters outside the Basic Multilingual Plane. Empty for unverified quotes, PDFs, or when the stored structure cannot place the quote (then `reason` says so).
+             */
+            block_ranges?: components["schemas"]["BlockRange"][];
+            /**
+             * Occurrence Count
+             * @description How many times the quote occurs (as whole words) in its document.
+             */
+            occurrence_count?: number | null;
+            /**
+             * Location Ambiguous
+             * @description The quote occurs more than once where it was found (the cited passage, the other passages given to the model, or the rest of the document): the location is the first of several equally plausible ones, not a definitive one.
+             * @default false
+             */
+            location_ambiguous: boolean;
+            /**
              * Reason
-             * @description Why the citation is unverified.
+             * @description Why the citation is unverified; for a verified one, where it was found when that is not simply the cited passage.
              */
             reason?: string | null;
         };
@@ -523,6 +580,41 @@ export interface components {
             llm_configured: boolean;
             checks: components["schemas"]["HealthChecks"];
         };
+        /**
+         * HighlightRect
+         * @description One highlight rectangle: a line of a verified quote on a PDF page.
+         */
+        HighlightRect: {
+            /**
+             * Page
+             * @description 1-based page number, as in `page_start` / `page_end`.
+             */
+            page: number;
+            /**
+             * Page Width
+             * @description Displayed page width in PDF points.
+             */
+            page_width: number;
+            /**
+             * Page Height
+             * @description Displayed page height in PDF points.
+             */
+            page_height: number;
+            /**
+             * X0
+             * @description Left, in PDF points from the page's left edge.
+             */
+            x0: number;
+            /**
+             * Y0
+             * @description Top, in PDF points from the page's top edge (y grows down).
+             */
+            y0: number;
+            /** X1 */
+            x1: number;
+            /** Y1 */
+            y1: number;
+        };
         /** LivenessResponse */
         LivenessResponse: {
             /**
@@ -753,7 +845,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json; charset=utf-8": components["schemas"]["HealthResponse"];
                 };
             };
             /** @description One or more checks failed */
@@ -762,7 +854,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json; charset=utf-8": components["schemas"]["HealthResponse"];
                 };
             };
         };
@@ -782,7 +874,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LivenessResponse"];
+                    "application/json; charset=utf-8": components["schemas"]["LivenessResponse"];
                 };
             };
         };
@@ -805,7 +897,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentList"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentList"];
                 };
             };
             /** @description Validation Error */
@@ -838,7 +930,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentOut"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentOut"];
                 };
             };
             /** @description Empty file */
@@ -897,7 +989,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentOut"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentOut"];
                 };
             };
             /** @description Validation Error */
@@ -957,7 +1049,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentOutline"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentOutline"];
                 };
             };
             /** @description Document not indexed yet */
@@ -995,7 +1087,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentPages"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentPages"];
                 };
             };
             /** @description Document not indexed yet */
@@ -1068,7 +1160,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DocumentOut"];
+                    "application/json; charset=utf-8": components["schemas"]["DocumentOut"];
                 };
             };
             /** @description Validation Error */
@@ -1101,7 +1193,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RetrievalResponse"];
+                    "application/json; charset=utf-8": components["schemas"]["RetrievalResponse"];
                 };
             };
             /** @description A selected document does not exist */
@@ -1146,7 +1238,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AnswerResponse"];
+                    "application/json; charset=utf-8": components["schemas"]["AnswerResponse"];
                 };
             };
             /** @description A selected document does not exist */

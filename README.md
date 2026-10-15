@@ -4,7 +4,8 @@
 answers backed by quotations that the backend has located in the document text before they are
 shown, so an invented quote is never presented as genuine.
 
-> **Project status: Phase 5 of 15 (grounded answering with verified quotations).** What exists today is listed under
+> **Project status: Phase 6 of 15 (citation verification and source locations, in the API; the
+> document viewer that draws the highlights is Phase 7).** What exists today is listed under
 > [What works](#what-works-today). Features described in the architecture doc are planned, not
 > implemented, until they appear in that list.
 
@@ -58,7 +59,15 @@ shown, so an invented quote is never presented as genuine.
       is verified against the stored canonical text before it is shown (exact character and page
       range, OCR quality), and an answer with no verified quotation is replaced by an explicit
       "insufficient support" statement. Works with any OpenAI-compatible provider; no reranker
-- [ ] Highlighting, streaming chat, comparison, research agent, full verification — Phases 6–12
+- [x] **Citation verification and locations** (in the `POST /api/answers` response): each quote is
+      searched in the *whole* text of its own document, as whole words only; small extraction
+      differences (a hyphen at a line break, a word split by a stray space) are tolerated
+      conservatively; repeated text reports its occurrence count and is flagged when the location
+      is ambiguous; verified PDF quotes come with highlight rectangles (one per line, on every
+      page the quote spans, OCR pages included) and verified Word quotes with ranges in the
+      extracted paragraphs/table rows. Details: [architecture §7](docs/ARCHITECTURE.md)
+- [ ] Viewer with click-to-highlight (Phase 7), streaming chat with history and stop (Phase 8),
+      comparison, research agent — Phases 7–12
 
 ### Known limitations (extraction)
 
@@ -67,6 +76,29 @@ shown, so an invented quote is never presented as genuine.
 - OCR is English-only by default (`OCR_LANGUAGE`); low-confidence OCR pages are flagged.
 - Heading detection is heuristic: unusual numbering schemes may be missed (the text is still
   fully indexed as passages).
+
+### Known limitations (quote verification) — where it could fail
+
+Verification fails *closed*: when in doubt a quote is shown as unverified, or verified without a
+highlight and with the reason, never as a match it is not.
+
+- **Verified means "the words exist in that document"**, not "the quote supports the sentence it
+  is attached to": a real quote cited for the wrong claim still verifies.
+- **Paraphrased or shortened quotes are unverified**, including quotes with "…" for omitted words
+  (accepted elisions could drop a "not"). Quotes under 2 words / 8 characters are too short.
+- **Extraction artefacts can still defeat a genuine quote**: text the extraction ran together
+  (`theAgreement`), a word split in more than two places or split twice the same way, or a
+  number split by a space. These are rejected rather than risk joining different words.
+- **Line-break hyphens are ambiguous in extracted text**: a quote of `resign` verifies against
+  a source `re-` + line break + `sign`, which may have been the different word `re-sign`.
+- **Repeated text**: if a quote occurs several times, the first plausible occurrence is located
+  and the citation is flagged ambiguous (`location_ambiguous`, `occurrence_count`).
+- **Not extracted, so never verifiable**: DOCX text boxes, footnotes, headers/footers; PDF
+  running headers/footers (removed as page furniture); unreadable pages. Low-quality OCR text
+  verifies only if the OCR read the words correctly.
+- **Highlights**: a rectangle covers whole words (it may include adjacent punctuation); if the
+  stored layout cannot place a quote reliably, it stays verified with no highlight. Word
+  documents are located in the extracted text (paragraphs, table rows), not in Word's layout.
 
 ## Repository layout
 

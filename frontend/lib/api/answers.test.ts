@@ -7,6 +7,7 @@ const citation = (n: number, status: "verified" | "unverified"): Citation => ({
   status,
   proposed_quote: "q",
   cited_evidence_id: "E1",
+  location_ambiguous: false,
 });
 
 describe("askDocuments", () => {

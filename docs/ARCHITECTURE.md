@@ -58,12 +58,12 @@ citation) is a `[char_start, char_end)` range into it.
 | `documents` | id, filename, file_type, sha256, storage_key, status (queued/processing/ready/failed), stage, progress, error_code, error_message, page_count, ocr_page_count |
 | `document_texts` | document_id, canonical_text |
 | `document_pages` (PDF) | page_number, width, height, rotation, char_start/end, extraction (text/ocr), `words` jsonb `[[cs,ce,x0,y0,x1,y1],…]` |
-| `blocks` | ordinal, kind (paragraph/heading/table_row/list_item), section_id, char/page ranges, docx_para_index |
+| `blocks` | ordinal (0-based), kind (paragraph/heading/table_row), section_id, char/page ranges. No `docx_para_index`: Word citations are located in the stored block text, which the viewer renders (§7) |
 | `sections` | parent_id, level, number (`8.2(a)`), number_normalized, title, char/page ranges |
 | `chunks` | section_id, section_path, char/page ranges, text, context_text, lexical_tokens, `embedding vector(384)` |
 | `chats`, `chat_documents` | a chat is bound to 1..n documents (history per document / document set) |
 | `messages` | role, mode (rag/agent), content, status (streaming/complete/stopped/error), grounding, coverage, evidence, agent_trace |
-| `citations` | claimed_quote, claimed_evidence_id, claimed_page (audit only), status (verified/unverified/ambiguous), match_type, matched_text, char/page ranges, occurrence_count, rects, failure_reason |
+| `citations` (Phase 8, with chat history) | claimed_quote, claimed_evidence_id, status (verified/unverified), matched_text, char/page ranges, occurrence_count, location_ambiguous, highlights / block_ranges, reason — mirroring `CitationOut` (§7) |
 | `comparisons`, `comparison_items` | change_type, aligned sections, word_diff, signals, category, significance, explanation |
 | `jobs` | kind (ingest/compare), status, attempts, heartbeat_at — stale jobs are re-queued on startup |
 
@@ -77,6 +77,7 @@ citation) is a `[char_start, char_end)` range into it.
 | `GET /api/documents/{id}/layout` (word boxes / blocks for the viewer) | 7 |
 | `POST /api/retrieval/search` `{query, document_ids[], top_k?}` → ranked passages + coverage | 4 ✅ |
 | `POST /api/answers` `{question, document_ids[]}` → answer, grounding, verified citations, evidence, exclusions | 5 ✅ |
+| … citation locations: `occurrence_count`, `location_ambiguous`, PDF `highlights`, DOCX `block_ranges` (§7) | 6 ✅ |
 | `POST /api/chats` · `GET /api/chats?document_id=` · `GET/DELETE /api/chats/{id}` | 8 |
 | `POST /api/chats/{id}/messages` → SSE · `POST /api/chats/{id}/messages/{mid}/stop` | 5–8 |
 | `POST /api/comparisons` · `GET /api/comparisons/{id}?type=&significance=&sort=` | 11 |
@@ -245,24 +246,78 @@ answering; streaming, chat history and stop are Phase 8.
   `not_found`. Notes always state how many excerpts the answer is based on and repeat OCR
   limitations (low-quality and unreadable pages, also when nothing matched).
 - The DB snapshot is closed before the LLM call: no connection is held while waiting.
-- Phase 6 extends verification: whole-document search, elided quotes, near-miss diagnostics,
-  highlight rectangles.
+- The verification described above is the Phase 5 scope; Phase 6 replaced it with whole-document
+  matching and added citation locations (§7).
 
-## 7. Citation verification (Phase 6) — independent of the LLM
+## 7. Citation verification (Phase 6 ✅) — independent of the LLM
 
-1. **Normalise with an offset map**: NFKC (ligatures), unify quotes/dashes, drop soft hyphens /
-   zero-width chars, join end-of-line hyphenation, collapse whitespace, case-fold. Punctuation kept.
-2. **Tiered match** over the whole document's normalised text: exact/normalised → whitespace-insensitive
-   (≥ 25 non-space chars) → elided (`…` segments in order within 600 chars) → otherwise
-   **unverified** (fuzzy search only produces a diagnostic "closest passage"; never verified,
-   never silently substituted). Quotes under 5 words are unverified as too short.
-3. **Duplicates**: prefer the occurrence inside the cited evidence chunk → any retrieved chunk →
-   LLM page claim as tie-breaker only → else `ambiguous` with an occurrence count.
-4. **Locate**: canonical range → pages → overlapping word boxes → per-line rectangles (multiple
-   pages for page-spanning quotes). DOCX: block + in-block ranges. The UI displays `matched_text`
-   (the document's own words), not the model's string.
-5. **Multi-document**: each quote is verified only against its own evidence's document.
-6. **Grounding**: grounded / partially grounded / ungrounded (warning, never shown as supported) / not found.
+**Implemented in Phase 6 ✅** (`app/verification/quotes.py`, `normalize.py`, `geometry.py`,
+`blocks.py`; wired in `app/answering/service.py`). It changes only the citations of the
+`POST /api/answers` response; the viewer that draws the locations is Phase 7. Nothing the model
+says about positions, pages or which occurrence it meant is used.
+
+1. **Normalise with an offset map** (Phase 5): NFKC (ligatures), unify quotes/dashes, drop soft
+   hyphens / zero-width chars, join end-of-line hyphenation, collapse whitespace, case-fold.
+   Punctuation kept. Every match maps back to the exact original characters.
+2. **Whole document, own document only**: a quote is searched in the full canonical text of the
+   document of the passage it cites, never in another selected document. A match must start and
+   end on word boundaries: not inside a word, a hyphenated compound, a number (`100,000`, `8.2`)
+   or an abbreviation (`U.S.`), so `s liability` never matches inside `Supplier's liability`.
+3. **Match strategies, in order** (a later one runs only if the earlier ones match nowhere in the
+   document, so an exact match always wins):
+   1. exact, after normalisation;
+   2. with a hyphen at a line break kept as a real hyphen (source `non-` + line break +
+      `compete` matches the quote `non-compete`);
+   3. tolerant of extraction spacing, conservatively: only quotes of ≥ 25 non-space characters;
+      spacing next to punctuation may differ, except around a separator inside a number
+      (`8.2` vs `8. 2`); between letters, only a word the source split (`Agree ment`), at most two
+      splits, and only if the document uses the word unsplit elsewhere, one piece is never a word
+      on its own, and no piece is a common short word (`the rapist` is never `therapist`); numbers
+      are never split or joined, and text the source ran together is never accepted.
+
+   Quotes need ≥ 2 words and ≥ 8 characters. **Elided quotes (`…` inside) stay unverified**: an
+   elision could drop a "not". **No fuzzy "closest passage" diagnostic** (no extra dependency):
+   an unverified quote states why (not found / inside a word / too short / elided).
+4. **Repeated text**: tiers: inside the cited passage → inside another passage of that document
+   given to the model → anywhere else in it. The first occurrence of the winning tier is reported;
+   if that tier holds several, `location_ambiguous` is true. `occurrence_count` counts whole-word
+   occurrences in the document (for the strategy that matched). A match outside every passage has
+   no `evidence_id`, and `reason` says where it was found. The model's page claim is not used even
+   as a tie-breaker, and ambiguity is a flag, not a third status: an ambiguous quote is real text.
+5. **Locate** (only for verified quotes, from data stored at extraction):
+   - **PDF → `highlights`**: the canonical range → the stored word boxes of only the pages it
+     spans → one rectangle per text line (lines read from the canonical text), on every page;
+     PDF points on the *displayed* page (rotation applied, origin top-left, y down) with the
+     page's displayed width/height; OCR pages use the same space; pages are 1-based. A rectangle
+     covers whole words, so it may include adjacent punctuation.
+   - **DOCX → `block_ranges`**: the stored blocks the range overlaps (0-based `block`, `kind`
+     paragraph/heading/table_row, the block's canonical range) and `[start, end)` within each
+     block's text; the blank line between blocks belongs to neither. The viewer renders the
+     stored block text, not Word's own layout.
+   - **Offsets count Unicode code points** (Python), like every character offset in the API.
+     JavaScript string indexes count UTF-16 units, so a consumer must convert for characters
+     outside the Basic Multilingual Plane (e.g. emoji).
+   - **Unreliable or missing location data never produces a location**: uncovered characters,
+     words or blocks inconsistent with their page/text, invalid boxes, a document reprocessed
+     while the answer was being generated (`processed_at` changed), a PDF quote on no stored page,
+     or a database error while reading the locations (the verified answer is kept). The citation
+     stays verified with no location and `reason` says why. Other errors still propagate.
+6. **Multi-document**: each quote is verified only against its own evidence's document.
+7. **Grounding** (Phase 5, unchanged): grounded / partially grounded / ungrounded (warning, never
+   shown as supported) / not found.
+
+**Known limitations and deferred follow-ups**:
+- Verification proves the words exist in the cited document, not that they support the claim
+  they are attached to (claim-level checking is out of scope).
+- Line-break hyphenation is ambiguous: the quote `resign` verifies against source `re-` + line
+  break + `sign`, which may have meant `re-sign` (normalisation joins line-break hyphens).
+- Each answer normalises the whole of every cited document per request (no cache between
+  requests): about 0.2–0.5 s and ~40 MB (peak ~80 MB) for a 150-page document, for up to 8 cited
+  documents. Retrieval also loads whole page rows, including word boxes it does not use.
+- Not extracted, so never verifiable: DOCX text boxes, footnotes, headers/footers; PDF running
+  headers/footers (removed as page furniture). Table cells in a DOCX row are stored as lines, so
+  the viewer cannot rebuild exact table columns.
+- Streaming of answers and incremental citation verification are Phase 8.
 
 ## 8. Agent — Part C, Option 2 (Phase 12)
 
