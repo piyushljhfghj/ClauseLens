@@ -4,10 +4,11 @@
 answers backed by quotations that the backend has located in the document text before they are
 shown, so an invented quote is never presented as genuine.
 
-> **Project status: Phase 6 of 15 (citation verification and source locations, in the API; the
-> document viewer that draws the highlights is Phase 7).** What exists today is listed under
-> [What works](#what-works-today). Features described in the architecture doc are planned, not
-> implemented, until they appear in that list.
+> **Project status: Phases 1–8 delivered.** Upload, extraction, retrieval, grounded answers with
+> verified citations, the PDF/Word viewers with citation highlights, and a question panel on each
+> document. Phase 8 is a single-question panel: streaming, chat history and the later phases
+> (comparison, research agent) are not implemented. What exists today is listed under
+> [What works](#what-works-today); anything else in the architecture doc is planned only.
 
 - Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Stack: Next.js 16 · FastAPI · PostgreSQL 16 + pgvector · SQLAlchemy 2 / Alembic · uv
@@ -28,7 +29,7 @@ shown, so an invented quote is never presented as genuine.
 - [x] **Inspection**: page count; password-protected, corrupt and empty files fail with a clear reason;
       **scanned PDFs with no text layer fail with an explanation** instead of becoming an empty document;
       partly scanned PDFs are flagged ("3 of 40 pages have no selectable text")
-- [x] **Document library**: list, open (PDF shown inline; DOCX downloadable), download, delete
+- [x] **Document library**: list, open (PDF and Word viewers), download, delete
       (removes the database rows and the stored file), retry failed processing
 - [x] **Text extraction with positions**: one canonical text per document; every PDF word keeps
       its character range and its box on the displayed page (rotation handled) for later
@@ -66,8 +67,22 @@ shown, so an invented quote is never presented as genuine.
       is ambiguous; verified PDF quotes come with highlight rectangles (one per line, on every
       page the quote spans, OCR pages included) and verified Word quotes with ranges in the
       extracted paragraphs/table rows. Details: [architecture §7](docs/ARCHITECTURE.md)
-- [ ] Viewer with click-to-highlight (Phase 7), streaming chat with history and stop (Phase 8),
-      comparison, research agent — Phases 7–12
+- [x] **Viewers** (Phase 7): PDF pages with verified quotes highlighted; Word documents shown as
+      their extracted paragraphs and table rows with the quoted range marked
+- [x] **Ask this document** (Phase 8): a question panel on each document page. Answers show
+      their citation markers; a verified quote with a reliable location opens in the viewer, and
+      any other (unverified, ambiguous, stale after reprocessing) explains why it can't. One
+      question at a time, with Cancel. The label says what was checked: *Quotes verified*,
+      *Partly verified* (see the notes), *No verified quotations* (answer withheld) or *No answer
+      found*. Small documents are given to the model whole; larger ones as selected excerpts
+- [x] **Answer statement checks** (no extra model call): uncited claims, quoted text not in the
+      sentence's own quotation (swapped markers included), numbers not in the cited quotation
+      ("30" matches "thirty"), and quotations cited for "the passages do not state…" sentences
+      all downgrade the label, with a note naming the sentence. Details:
+      [architecture §6–7](docs/ARCHITECTURE.md)
+- [x] **Answer-quality evaluation**: frozen synthetic cases with automatic checks and reports
+      for human review (see [Tests and checks](#tests-and-checks))
+- [ ] Streaming answers, chat history, comparison, research agent (later phases)
 
 ### Known limitations (extraction)
 
@@ -83,7 +98,9 @@ Verification fails *closed*: when in doubt a quote is shown as unverified, or ve
 highlight and with the reason, never as a match it is not.
 
 - **Verified means "the words exist in that document"**, not "the quote supports the sentence it
-  is attached to": a real quote cited for the wrong claim still verifies.
+  is attached to": a real quote cited for the wrong claim still verifies. The statement checks
+  catch some mismatches (quoted text, numbers, swapped markers), but an unsupported paraphrase
+  with no quoted text or numbers is not detected, so read the quotes. The panel says so.
 - **Paraphrased or shortened quotes are unverified**, including quotes with "…" for omitted words
   (accepted elisions could drop a "not"). Quotes under 2 words / 8 characters are too short.
 - **Extraction artefacts can still defeat a genuine quote**: text the extraction ran together
@@ -99,6 +116,17 @@ highlight and with the reason, never as a match it is not.
 - **Highlights**: a rectangle covers whole words (it may include adjacent punctuation); if the
   stored layout cannot place a quote reliably, it stays verified with no highlight. Word
   documents are located in the extracted text (paragraphs, table rows), not in Word's layout.
+
+### Known limitations (answers)
+
+- A reply made only of "the passages provided do not state…" sentences is shown as *No answer
+  found* in the model's words; it is not verified and does not prove the document lacks the
+  information. Any other reply without a verified quotation is withheld.
+- If the model ignores the answer format, the reply is withheld (no retry).
+- Only digits in an answer are checked against its quotations; a number the answer writes in
+  words ("three strengths") is not.
+- Retrieval can miss a relevant passage in larger documents (excerpt mode); small documents are
+  read whole.
 
 ## Repository layout
 
@@ -146,6 +174,17 @@ cd frontend; npm test; npm run lint; npm run typecheck
 
 Database integration tests run against a separate `clauselens_test` database (created and
 migrated automatically) when the Docker database is up, and are skipped otherwise.
+
+The answer-quality evaluation calls the real model (`LLM_*` settings), so it only runs when
+asked: pass A is 15 calls, pass B 14, each refused beyond its budget. Reports (Markdown, JSON,
+CSV) go to `%TEMP%\clauselens-eval\` (or `CLAUSELENS_EVAL_DIR`) and leave citation support
+*PENDING* for a human reviewer.
+
+```powershell
+cd backend
+$env:CLAUSELENS_LLM_EVAL = "1"; $env:CLAUSELENS_LLM_EVAL_PASS = "A"
+uv run pytest -s tests/test_eval_answers.py::test_answer_quality_evaluation
+```
 
 ## Configuration
 
