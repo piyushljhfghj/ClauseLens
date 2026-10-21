@@ -2,7 +2,9 @@
 
 Retrieval returns a ranked list that always fills top-k; the tail is often only weakly related
 (one retriever, low similarity). Sending it to the model invites answers built on irrelevant
-text, so a passage is kept only on strong signals:
+text. A passage made only of headings (a section title on its own, per the stored block kinds)
+is never evidence, whatever its signals: it would take a slot and give the model nothing to
+quote. Otherwise a passage is kept only on strong signals:
 
 - an exact phrase or the named clause matched, or
 - the semantic and keyword retrievers agree (both ranked it), or
@@ -15,6 +17,11 @@ text, so a passage is kept only on strong signals:
 Kept passages are then packed into a token budget: each document's best passage first (so a
 multi-document question sees every relevant document), then the rest in rank order.
 No reranker is used: ranking is Phase 4's Reciprocal Rank Fusion.
+
+Small-document mode: when every meaningful passage of the selected documents (all but
+headings-only ones) fits the same token budget, the model is given all of them in document
+order instead, with no similarity threshold or passage limit. It is all or nothing: a document
+set that does not fit uses the selection above, never a truncated document.
 """
 
 import uuid
@@ -27,6 +34,7 @@ from app.text.tokenize import lexical_tokens
 CHARS_PER_TOKEN = 4
 MIN_MATCHED_TERMS = 2
 HEADER_TOKENS = 30  # evidence label, document name, section, pages, quality line
+NO_CONTENT = "no substantive content (headings only)"
 
 
 @dataclass(frozen=True)
@@ -34,10 +42,29 @@ class Selection:
     selected: list[RetrievedPassage]  # in the order they are shown to the model (E1, E2, ...)
     excluded: list[tuple[RetrievedPassage, str]]  # passage, reason
     tokens_used: int
+    whole_documents: bool = False  # small-document mode: every meaningful passage selected
+
+
+def estimate_tokens_for_chars(chars: int) -> int:
+    """The context cost of a passage of `chars` characters (code points)."""
+    return chars // CHARS_PER_TOKEN + HEADER_TOKENS
 
 
 def estimate_tokens(passage: RetrievedPassage) -> int:
-    return len(passage.text) // CHARS_PER_TOKEN + HEADER_TOKENS
+    return estimate_tokens_for_chars(len(passage.text))
+
+
+def whole_document_selection(
+    passages: list[RetrievedPassage], retrieved: list[RetrievedPassage], settings: Settings
+) -> Selection | None:
+    """All of `passages` (every meaningful passage of the documents, in document order) if they
+    fit the context budget by the same estimate as `select_context`; None otherwise.
+    Retrieved headings-only passages are reported as excluded, as in `select_context`."""
+    used = sum(estimate_tokens(p) for p in passages)
+    if not passages or used > settings.answer_context_token_budget:
+        return None
+    excluded = [(p, NO_CONTENT) for p in retrieved if p.headings_only]
+    return Selection(selected=passages, excluded=excluded, tokens_used=used, whole_documents=True)
 
 
 def strength_reason(
@@ -49,6 +76,8 @@ def strength_reason(
     settings: Settings,
 ) -> str | None:
     """None if the passage is strong enough; otherwise why it is excluded."""
+    if passage.headings_only:
+        return NO_CONTENT
     s = passage.signals
     if s.phrase_rank is not None or s.section_rank is not None:
         return None

@@ -12,12 +12,18 @@ import asyncio
 import uuid
 from collections import defaultdict
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import AppError, ConflictError, NotFoundError
-from app.db.models import Document, DocumentChunk, DocumentPage
+from app.db.models import (
+    Document,
+    DocumentBlock,
+    DocumentChunk,
+    DocumentPage,
+    DocumentSection,
+)
 from app.embeddings import Embedder
 from app.ingestion.model import LOW_QUALITY_NOTE
 from app.ingestion.pipeline import INDEX_VERSION
@@ -41,6 +47,10 @@ from app.schemas.retrieval import (
 
 # Fetch more fused candidates than requested, so near-duplicate removal can still fill top_k.
 DEDUP_HEADROOM = 3
+
+
+# A search-only note: true of the search results, not of a whole-document answer.
+NEAR_DUPLICATES_OMITTED = "near-duplicate passage(s) were omitted."
 
 
 class RetrievalService:
@@ -87,7 +97,7 @@ class RetrievalService:
         if analysis.has_content:
             passages, removed = await self._retrieve(analysis, documents, top_k)
             if removed:
-                notes.append(f"{removed} near-duplicate passage(s) were omitted.")
+                notes.append(f"{removed} {NEAR_DUPLICATES_OMITTED}")
 
         for doc in coverage:
             if doc.unreadable_page_count:
@@ -218,10 +228,120 @@ class RetrievalService:
         kept, removed = remove_near_duplicates(head, {i: c.text for i, c in chunks.items()})
         kept = kept[:top_k]
         quality = await self._quality([chunks[f.chunk_id] for f in kept])
+        headings_only = await self.headings_only_chunks([f.chunk_id for f in kept])
         return [
-            self._passage(rank, f, chunks[f.chunk_id], documents, quality)
+            self._passage(rank, f, chunks[f.chunk_id], documents, quality, headings_only)
             for rank, f in enumerate(kept, start=1)
         ], removed
+
+    @staticmethod
+    def _headings_only_ids(scope: ColumnElement[bool]) -> Select[tuple[int]]:
+        """Ids of the chunks within `scope` with no substantive text: every stored block is a
+        bare heading, i.e. a heading block that opens an unnumbered heading section ("About
+        Yourself"), whose whole block is the heading. A numbered clause stored as a heading
+        block may carry its body on the same line ("15. Governing Law. This Agreement is
+        governed by..."), so it counts as content, as does a chunk without stored blocks: when
+        in doubt, a passage has content."""
+        bare_heading = and_(DocumentBlock.kind == "heading", DocumentSection.kind == "heading")
+        return (
+            select(DocumentChunk.id)
+            .join(
+                DocumentBlock,
+                and_(
+                    DocumentBlock.document_id == DocumentChunk.document_id,
+                    DocumentBlock.ordinal >= DocumentChunk.block_start,
+                    DocumentBlock.ordinal <= DocumentChunk.block_end,
+                ),
+            )
+            .outerjoin(DocumentSection, DocumentSection.id == DocumentBlock.section_id)
+            .where(scope)
+            .group_by(DocumentChunk.id)
+            .having(func.bool_and(func.coalesce(bare_heading, False)))
+        )
+
+    async def headings_only_chunks(self, chunk_ids: list[int]) -> set[int]:
+        """Which of `chunk_ids` (a search's passages, at most top_k) have no substantive text."""
+        if not chunk_ids:
+            return set()
+        rows = await self._session.execute(self._headings_only_ids(DocumentChunk.id.in_(chunk_ids)))
+        return set(rows.scalars())
+
+    # --- whole documents (small-document mode); call after `search`, in its snapshot ---------
+
+    def _meaningful(self, document_ids: list[uuid.UUID]) -> ColumnElement[bool]:
+        """The chunks of the documents that are not headings-only (scoped by document, so the
+        query never lists passage ids)."""
+        headings = self._headings_only_ids(DocumentChunk.document_id.in_(document_ids))
+        return and_(
+            DocumentChunk.document_id.in_(document_ids),
+            DocumentChunk.id.not_in(headings.scalar_subquery()),
+        )
+
+    async def meaningful_passage_cost(
+        self, document_ids: list[uuid.UUID], *, chars_per_token: int, header_tokens: int
+    ) -> int:
+        """The estimated context cost of every meaningful passage of the documents, as
+        sum(length // chars_per_token + header_tokens), computed in the database in one
+        aggregate. A passage's text is canonical_text[char_start:char_end], so its length is
+        char_end - char_start: no passage text is read."""
+        length = DocumentChunk.char_end - DocumentChunk.char_start
+        cost = func.div(length, chars_per_token) + header_tokens
+        row = await self._session.execute(
+            select(func.coalesce(func.sum(cost), 0)).where(self._meaningful(document_ids))
+        )
+        return int(row.scalar_one())
+
+    async def meaningful_passages(
+        self, document_ids: list[uuid.UUID], retrieved: list[RetrievedPassage]
+    ) -> list[RetrievedPassage]:
+        """Every meaningful passage of the documents, documents in the given order and passages
+        in text order. A passage the search found keeps its rank and signals; any other has
+        rank 0 and no signals (it was included because the whole document fits)."""
+        chunks = list(
+            (
+                await self._session.execute(
+                    select(DocumentChunk).where(self._meaningful(document_ids))
+                )
+            ).scalars()
+        )
+        if not chunks:
+            return []
+        filenames = dict(
+            (
+                await self._session.execute(
+                    select(Document.id, Document.filename).where(Document.id.in_(document_ids))
+                )
+            ).all()
+        )
+        position = {document_id: i for i, document_id in enumerate(document_ids)}
+        chunks.sort(key=lambda c: (position[c.document_id], c.ordinal))
+        quality = await self._quality(chunks)
+        found = {p.chunk_id: p for p in retrieved}
+        passages = []
+        for chunk in chunks:
+            if chunk.id in found:
+                passages.append(found[chunk.id])
+                continue
+            passages.append(
+                RetrievedPassage(
+                    rank=0,
+                    score=0.0,
+                    document_id=chunk.document_id,
+                    document_filename=filenames[chunk.document_id],
+                    chunk_id=chunk.id,
+                    chunk_ordinal=chunk.ordinal,
+                    section_id=chunk.section_id,
+                    section_path=chunk.section_path,
+                    char_start=chunk.char_start,
+                    char_end=chunk.char_end,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                    text=chunk.text,
+                    signals=RetrievalSignals(),
+                    quality=quality[chunk.id],
+                )
+            )
+        return passages
 
     async def _quality(self, chunks: list[DocumentChunk]) -> dict[int, PassageQuality]:
         """Extraction quality of each passage's pages, from the stored per-page records."""
@@ -267,6 +387,7 @@ class RetrievalService:
         chunk: DocumentChunk,
         documents: dict[uuid.UUID, Document],
         quality: dict[int, PassageQuality],
+        headings_only: set[int],
     ) -> RetrievedPassage:
         phrase_ranks = [r for name, r in fused.ranks.items() if name.startswith("phrase")]
         return RetrievedPassage(
@@ -294,4 +415,5 @@ class RetrievalService:
                 section_rank=fused.ranks.get("section"),
             ),
             quality=quality[chunk.id],
+            headings_only=chunk.id in headings_only,
         )

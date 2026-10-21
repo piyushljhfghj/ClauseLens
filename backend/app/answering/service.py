@@ -6,7 +6,8 @@
 
 Nothing the model says about sources is trusted. An answer with no verified quotation is never
 presented as an answer: the response states that support was insufficient and keeps the
-model's draft separately for transparency.
+model's draft separately for transparency. The one exception claims no facts: a reply that
+only says what the passages do not state is shown as "not found", in the model's words.
 """
 
 import asyncio
@@ -16,22 +17,40 @@ import logging
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.answering.context import select_context
-from app.answering.integrity import corruption, degenerate_repetition, uncited_statements
-from app.answering.parser import ProposedCitation, parse_output
+from app.answering.context import (
+    CHARS_PER_TOKEN,
+    HEADER_TOKENS,
+    Selection,
+    estimate_tokens,
+    select_context,
+    whole_document_selection,
+)
+from app.answering.integrity import (
+    cited_absence_statements,
+    corruption,
+    degenerate_repetition,
+    misattributed_statements,
+    only_absence,
+    uncited_statements,
+    unverified_figures,
+)
+from app.answering.parser import ProposedCitation, parse_output, strip_protocol_tags
 from app.answering.prompt import INSUFFICIENT_ANSWER, build_messages
 from app.core.config import Settings
 from app.db.models import Document, DocumentBlock, DocumentPage, DocumentText
 from app.embeddings import Embedder
 from app.ingestion.model import LOW_QUALITY_NOTE
 from app.llm import INCOMPLETE_OUTPUT, LLMClient, LLMNotConfiguredError, LLMOutputInvalidError
-from app.retrieval.service import RetrievalService
+from app.retrieval.service import NEAR_DUPLICATES_OMITTED, RetrievalService
 from app.schemas.answers import (
+    AnswerDocument,
     AnswerResponse,
     BlockRange,
     CitationOut,
@@ -40,7 +59,12 @@ from app.schemas.answers import (
     Grounding,
     HighlightRect,
 )
-from app.schemas.retrieval import DocumentCoverage, PassageQuality, RetrievedPassage
+from app.schemas.retrieval import (
+    DocumentCoverage,
+    PassageQuality,
+    RetrievalResponse,
+    RetrievedPassage,
+)
 from app.verification.blocks import StoredBlock, block_ranges
 from app.verification.geometry import PageGeometry, highlight_boxes
 from app.verification.normalize import normalize
@@ -72,8 +96,8 @@ PageRecords = dict[uuid.UUID, list[PageRecord]]  # document -> its pages, in pag
 class DocumentVersion:
     """A document as of the snapshot the answer was built from."""
 
-    processed_at: object  # changes on every (re)processing
-    file_type: str  # pdf | docx
+    processed_at: datetime | None  # changes on every (re)processing
+    file_type: Literal["pdf", "docx"]
 
 
 Versions = dict[uuid.UUID, DocumentVersion]
@@ -114,18 +138,27 @@ class AnswerService:
                 "LLM_MODEL on the server."
             )
         settings = self._settings
-        retrieval = await RetrievalService(self._session, self._embedder, settings).search(
-            question, document_ids, top_k=settings.answer_candidate_top_k
-        )
-        selection = select_context(retrieval.passages, settings, tuple(retrieval.analysis.terms))
+        retrieval, selection = await self.select_evidence(question, document_ids)
         # Verification searches the whole text of each document that evidence came from. It is
-        # read in the same snapshot as the passages, so their offsets agree.
-        sources, pages, versions = await self._load_documents(selection.selected)
+        # read in the same snapshot as the passages, so their offsets agree; so are the versions
+        # of all selected documents, which the response reports.
+        sources, pages, versions = await self._load_documents(document_ids, selection.selected)
         # End the read-only snapshot now: the LLM call can take seconds and must not hold a
         # database connection. Everything verification needs is already in memory.
         await self._session.rollback()
 
+        documents = [
+            AnswerDocument(
+                id=document_id,
+                file_type=versions[document_id].file_type,
+                processed_at=versions[document_id].processed_at,
+            )
+            for document_id in dict.fromkeys(document_ids)
+        ]
         notes = list(retrieval.notes)
+        if selection.whole_documents:
+            # The model saw every passage: a search-only note about omitted passages is untrue.
+            notes = [n for n in notes if not n.endswith(NEAR_DUPLICATES_OMITTED)]
         excluded = [
             ExcludedPassage(
                 document_id=p.document_id,
@@ -136,6 +169,12 @@ class AnswerService:
             for p, reason in selection.excluded
         ]
         weak = sum(1 for _, reason in selection.excluded if reason.startswith("weak"))
+        if selection.whole_documents:
+            notes.append(
+                "The selected document(s) fit the model's context, so the model was given their "
+                f"full text ({len(selection.selected)} passage(s), headings excluded), not only "
+                "the best-matching excerpts."
+            )
         if weak:
             notes.append(f"{weak} weakly related passage(s) were not used as evidence.")
 
@@ -152,17 +191,24 @@ class AnswerService:
                 evidence=[],
                 excluded=excluded,
                 coverage=retrieval.coverage,
+                documents=documents,
                 notes=notes,
             )
 
         evidence = {f"E{i}": p for i, p in enumerate(selection.selected, start=1)}
+        # The context boundary: never more evidence than the budget, whichever path chose it.
+        if (
+            sum(estimate_tokens(p) for p in evidence.values())
+            > settings.answer_context_token_budget
+        ):
+            raise RuntimeError("Selected evidence exceeds the context budget.")
         result = await self._llm.complete(build_messages(retrieval.query, evidence))
         parsed = parse_output(result.text)
         # The exact "insufficient" reply is complete even if its closing tag is missing.
         truncated = parsed.truncated and not _is_insufficient(parsed.answer)
         _check_output(parsed.answer, truncated, [p.text for p in evidence.values()])
         notes.extend(parsed.problems)
-        notes.append(_reading_note(evidence, retrieval.coverage))
+        notes.append(_reading_note(evidence, retrieval.coverage, selection.whole_documents))
         if any(p.quality.level == "low_quality_ocr" for p in evidence.values()):
             notes.append(
                 "Some evidence comes from low-quality OCR pages: it may be misrecognised or "
@@ -191,6 +237,7 @@ class AnswerService:
             "evidence": evidence_out,
             "excluded": excluded,
             "coverage": retrieval.coverage,
+            "documents": documents,
             "model": result.model,
             "usage": result.usage,
         }
@@ -203,6 +250,18 @@ class AnswerService:
                 notes=notes,
                 **common,
             )
+        # A reply that only says what the passages do not state ("The passages provided do not
+        # support that assumption.") claims nothing a quotation could prove: it is shown as "no
+        # answer found" in the model's own words (a premise stays corrected), never as verified.
+        if not parsed.citations and not parsed.markers and only_absence(parsed.answer):
+            notes.append(
+                "The reply only says what the passages provided do not state. It cites no "
+                "quotation, so nothing in it is verified, and it does not prove the document "
+                "lacks the information."
+            )
+            return AnswerResponse(
+                answer=parsed.answer, grounding="not_found", citations=[], notes=notes, **common
+            )
 
         # CPU-bound (normalising a 150-page document takes ~0.2 s): keep it off the event loop.
         citations = await asyncio.to_thread(
@@ -210,8 +269,26 @@ class AnswerService:
         )
         citations = await self._add_highlights(citations, sources, versions)
         citations = await self._add_block_ranges(citations, sources, versions)
+        markers = set(parsed.markers)
+        citations = [
+            c.model_copy(
+                update={"referenced": c.n in markers, "marker_conflict": c.n in parsed.conflicts}
+            )
+            for c in citations
+        ]
+        # Text the answer quotes must be in the statement's own verified quotations.
+        quotes: dict[int, list[str]] = defaultdict(list)
+        for c in citations:
+            if c.status == "verified" and c.n not in parsed.conflicts:
+                quotes[c.n] += [q for q in (c.quote, c.proposed_quote) if q]
         grounding, grounding_notes = _grounding(
-            parsed.markers, citations, uncited_statements(parsed.answer)
+            parsed.markers,
+            citations,
+            uncited_statements(parsed.answer),
+            conflicts=parsed.conflicts,
+            misattributed=misattributed_statements(parsed.answer, quotes),
+            cited_absence=cited_absence_statements(parsed.answer),
+            figures=unverified_figures(parsed.answer, quotes),
         )
         notes.extend(grounding_notes)
         for citation in citations:
@@ -233,24 +310,65 @@ class AnswerService:
             answer=parsed.answer, grounding=grounding, citations=citations, notes=notes, **common
         )
 
+    async def select_evidence(
+        self, question: str, document_ids: list[uuid.UUID]
+    ) -> tuple[RetrievalResponse, Selection]:
+        """Retrieval and the evidence the model is given: the whole text of the selected
+        documents when all their meaningful passages fit the context budget (small-document
+        mode), the selected strong passages otherwise. Leaves the read snapshot open."""
+        settings = self._settings
+        retriever = RetrievalService(self._session, self._embedder, settings)
+        retrieval = await retriever.search(
+            question, document_ids, top_k=settings.answer_candidate_top_k
+        )
+        whole = await self._whole_documents(retriever, document_ids, retrieval)
+        if whole is not None:
+            return retrieval, whole
+        return retrieval, select_context(
+            retrieval.passages, settings, tuple(retrieval.analysis.terms)
+        )
+
+    async def _whole_documents(
+        self,
+        retriever: RetrievalService,
+        document_ids: list[uuid.UUID],
+        retrieval: RetrievalResponse,
+    ) -> Selection | None:
+        """Small-document mode, or None. Only for a question the search could relate to the
+        documents (an off-topic or empty question still never reaches the model), and only if
+        every meaningful passage fits. The fit is first decided in the database from stored
+        offsets, with the estimator's own constants, so a document that cannot fit is rejected
+        without reading any passage text; passages are loaded only when it fits, and the fit is
+        confirmed on their text with `estimate_tokens`."""
+        if not retrieval.passages:
+            return None
+        ids = list(dict.fromkeys(document_ids))
+        cost = await retriever.meaningful_passage_cost(
+            ids, chars_per_token=CHARS_PER_TOKEN, header_tokens=HEADER_TOKENS
+        )
+        if cost > self._settings.answer_context_token_budget:
+            return None
+        passages = await retriever.meaningful_passages(ids, retrieval.passages)
+        return whole_document_selection(passages, retrieval.passages, self._settings)
+
     # --- helpers --------------------------------------------------------------------------------
 
     async def _load_documents(
-        self, passages: list[RetrievedPassage]
+        self, selected: list[uuid.UUID], passages: list[RetrievedPassage]
     ) -> tuple[dict[uuid.UUID, SourceDocument], PageRecords, Versions]:
-        """Canonical text, page records and processing version of every document the evidence
-        comes from."""
-        document_ids = sorted({p.document_id for p in passages}, key=str)
-        if not document_ids:
-            return {}, {}, {}
+        """Processing version of every selected document, and canonical text and page records of
+        every document the evidence comes from. Must run in the retrieval's snapshot."""
         version_rows = await self._session.execute(
             select(Document.id, Document.processed_at, Document.file_type).where(
-                Document.id.in_(document_ids)
+                Document.id.in_(selected)
             )
         )
         versions: Versions = {
             row.id: DocumentVersion(row.processed_at, row.file_type) for row in version_rows
         }
+        document_ids = sorted({p.document_id for p in passages}, key=str)
+        if not document_ids:
+            return {}, {}, versions
         texts = await self._session.execute(
             select(DocumentText.document_id, DocumentText.canonical_text).where(
                 DocumentText.document_id.in_(document_ids)
@@ -620,7 +738,13 @@ def _quote_quality(
 
 
 def _is_insufficient(answer: str) -> bool:
-    return normalize(answer).text == normalize(INSUFFICIENT_ANSWER).text
+    """The prompt's fixed "insufficient evidence" reply, however it was wrapped or spaced (tags,
+    quotes, a missing final full stop): an abstention, never an unsupported answer."""
+
+    def core(text: str) -> str:
+        return normalize(strip_protocol_tags(text)).text.strip(" \"'.")
+
+    return core(answer) == core(INSUFFICIENT_ANSWER)
 
 
 def _check_output(answer: str, truncated: bool, evidence_texts: list[str]) -> None:
@@ -644,27 +768,55 @@ def _check_output(answer: str, truncated: bool, evidence_texts: list[str]) -> No
 
 
 def _grounding(
-    markers: list[int], citations: list[CitationOut], uncited: list[str] | None = None
+    markers: list[int],
+    citations: list[CitationOut],
+    uncited: list[str] | None = None,
+    *,
+    conflicts: set[int] | frozenset[int] = frozenset(),
+    misattributed: list[str] | None = None,
+    cited_absence: list[str] | None = None,
+    figures: list[str] | None = None,
 ) -> tuple[Grounding, list[str]]:
-    verified = {c.n for c in citations if c.status == "verified"}
+    """The answer's grounding and the notes explaining any downgrade. A marker counts only if
+    its number has one verified quotation: a number used for different quotations (a conflict)
+    supports nothing, and a statement whose quoted text or figures are not in its own cited
+    quotations, or that cites a quotation for something the passages do not state, is reported.
+    Whether a quotation supports its statement is not otherwise checked here."""
+    notes: list[str] = []
+    if conflicts:
+        notes.append(
+            f"Citation number(s) {', '.join(f'[{n}]' for n in sorted(conflicts))} are used for "
+            "more than one quotation, so the statements marked with them cannot be matched to a "
+            "quotation and are not supported."
+        )
+    verified = {c.n for c in citations if c.status == "verified" and c.n not in conflicts}
     if not verified:
         return "ungrounded", [
-            "No quotation in the model's answer could be verified against the documents, so the "
+            *notes,
+            "No statement in the answer has a verified quotation it can be matched to, so the "
             "answer is not presented."
+            if conflicts
+            else "No quotation in the model's answer could be verified against the documents, "
+            "so the answer is not presented.",
         ]
-    notes: list[str] = []
-    unverified = sorted(c.n for c in citations if c.status != "verified")
+    unverified = sorted({c.n for c in citations if c.status != "verified"} - set(conflicts))
     unsupported = sorted(set(markers) - verified)
     if unverified:
         notes.append(
             f"Citation(s) {', '.join(f'[{n}]' for n in unverified)} could not be verified; "
             "statements relying on them are not supported."
         )
-    missing = sorted(set(unsupported) - set(unverified))
+    missing = sorted(set(unsupported) - set(unverified) - set(conflicts))
     if missing:
         notes.append(
             f"Marker(s) {', '.join(f'[{n}]' for n in missing)} have no citation; those "
             "statements are not supported."
+        )
+    unreferenced = sorted({c.n for c in citations} - set(markers)) if markers else []
+    if missing and unreferenced:
+        notes.append(
+            "The answer's markers and citation numbers do not match; the model may have numbered "
+            "them inconsistently. They are not matched up automatically."
         )
     if not markers:
         notes.append("The answer does not mark which statements its quotations support.")
@@ -673,11 +825,44 @@ def _grounding(
             f"{len(uncited)} statement(s) in the answer have no citation and are not supported: "
             + " | ".join(f'"{statement[:80]}"' for statement in uncited)
         )
-    return ("grounded" if not notes else "partially_grounded"), notes
+    if misattributed:
+        notes.append(
+            f"{len(misattributed)} statement(s) quote text that is not in the quotation they "
+            "cite, so that text is not verified: "
+            + " | ".join(f'"{statement[:80]}"' for statement in misattributed)
+        )
+    if figures:
+        notes.append(
+            f"{len(figures)} statement(s) contain a number that is not in the quotation they "
+            "cite, so that number is not verified: "
+            + " | ".join(f'"{statement[:80]}"' for statement in figures)
+        )
+    if cited_absence:
+        notes.append(
+            f"{len(cited_absence)} statement(s) say the passages do not state something but "
+            "cite a quotation, which cannot show that something is missing: "
+            + " | ".join(f'"{statement[:80]}"' for statement in cited_absence)
+        )
+    grounding: Grounding = "grounded" if not notes else "partially_grounded"
+    if unreferenced:
+        # Informational, not a downgrade by itself (every marked statement may still be
+        # verified), but never silent: such a quotation supports none of the answer's statements.
+        notes.append(
+            f"Citation(s) {', '.join(f'[{n}]' for n in unreferenced)} are not referenced by any "
+            "marker in the answer, so they support none of its statements."
+        )
+    return grounding, notes
 
 
-def _reading_note(evidence: dict[str, RetrievedPassage], coverage: list[DocumentCoverage]) -> str:
+def _reading_note(
+    evidence: dict[str, RetrievedPassage], coverage: list[DocumentCoverage], whole: bool = False
+) -> str:
     searched = sum(c.chunks_searched for c in coverage)
+    if whole:
+        return (
+            "The answer is based on the full text of the selected document(s): all "
+            f"{len(evidence)} passage(s) with content, of {searched} in total."
+        )
     by_document: dict[str, set[int]] = defaultdict(set)
     for p in evidence.values():
         if p.page_start is not None and p.page_end is not None:

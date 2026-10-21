@@ -423,9 +423,10 @@ async def test_sql_statements_per_search_are_bounded(
     finally:
         event.remove(sync_engine, "before_cursor_execute", count)
     # scope + coverage + dense + bm25 + section + 2 phrases + chunk fetch + 2 page lookups (one per
-    # document) = 10, plus transaction set-up statements issued by the driver/SQLAlchemy.
+    # document) + one headings-only check for all passages = 11, plus transaction set-up
+    # statements issued by the driver/SQLAlchemy.
     selects = [s for s in statements if s.lstrip().upper().startswith(("SELECT", "WITH"))]
-    assert len(selects) <= 10, selects
+    assert len(selects) <= 11, selects
 
 
 async def test_internal_errors_do_not_leak_details(
@@ -460,3 +461,33 @@ async def test_no_match_on_low_quality_pages_is_not_presented_as_absence(
     result = await search(api, "network routing protocols", doc_id)
     assert result["no_match"] is True
     assert any("2 page(s) were read with low OCR quality" in n for n in result["notes"])
+
+
+# --- P1 Step 1a: passages without substantive content ------------------------------------------
+
+
+async def test_headings_only_passages_are_flagged_from_stored_block_kinds(
+    api: httpx.AsyncClient, live_app: FastAPI
+) -> None:
+    from tests.fixtures.journal import journal_docx
+
+    journal = await upload(api, live_app, "journal.docx", journal_docx())
+    contract = await upload(api, live_app, "contract.pdf", contract_pdf(CONTRACT_A))
+    found = await search(api, "about yourself learning experiences", journal, top_k=50)
+    flagged = {p["text"].strip() for p in found["passages"] if p["headings_only"]}
+    assert flagged == {"About Yourself", "My Learning Experiences"}
+    # Content passages, including ones that start with a heading, are not flagged.
+    assert any("Strengths:" in p["text"] for p in found["passages"] if not p["headings_only"])
+    pdf = await search(api, "terminate this agreement", contract)
+    assert pdf["passages"] and not any(p["headings_only"] for p in pdf["passages"])
+
+
+async def test_numbered_clause_with_inline_title_is_content_not_a_heading(
+    api: httpx.AsyncClient, live_app: FastAPI, contract_a: str
+) -> None:
+    # Regression (found while implementing Step 1a): "15. Governing Law. This Agreement is
+    # governed by ..." is stored as a heading block, yet carries the clause's body. Block kind
+    # alone wrongly made it "headings only" and removed it from answer evidence.
+    found = await search(api, "governing law", contract_a, top_k=20)
+    clause = [p for p in found["passages"] if "governed by the laws" in p["text"]]
+    assert clause and not any(p["headings_only"] for p in clause)

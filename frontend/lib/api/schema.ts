@@ -197,6 +197,27 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AnswerDocument
+         * @description A selected document as of the snapshot the answer was produced from.
+         */
+        AnswerDocument: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * File Type
+             * @enum {string}
+             */
+            file_type: "pdf" | "docx";
+            /**
+             * Processed At
+             * @description The document version (when its index was built) that retrieval, quote verification and citation locations used; serialized exactly as by the documents API. If the document's current `processed_at` differs, it has been reprocessed since and the citations' locations must not be shown on it.
+             */
+            processed_at: string | null;
+        };
         /** AnswerRequest */
         AnswerRequest: {
             /**
@@ -232,6 +253,11 @@ export interface components {
             excluded: components["schemas"]["ExcludedPassage"][];
             /** Coverage */
             coverage: components["schemas"]["DocumentCoverage"][];
+            /**
+             * Documents
+             * @description Every selected document, in the order requested, with the version the answer was produced from.
+             */
+            documents: components["schemas"]["AnswerDocument"][];
             /** Notes */
             notes: string[];
             /**
@@ -355,6 +381,18 @@ export interface components {
              * @description Why the citation is unverified; for a verified one, where it was found when that is not simply the cited passage.
              */
             reason?: string | null;
+            /**
+             * Marker Conflict
+             * @description This citation's number is also used for a different quotation, so which statement it supports is unknown; the statements marked with it are not supported.
+             * @default false
+             */
+            marker_conflict: boolean;
+            /**
+             * Referenced
+             * @description Whether the answer text has a marker [n] for this citation. An unreferenced citation supports no statement of the answer (the model may have numbered its markers and citations inconsistently).
+             * @default true
+             */
+            referenced: boolean;
         };
         /** ComponentCheck */
         ComponentCheck: {
@@ -568,7 +606,10 @@ export interface components {
             page_end: number | null;
             /** Text */
             text: string;
-            /** Retrieval Rank */
+            /**
+             * Retrieval Rank
+             * @description Rank in the search results; 0 when the search did not return the passage and it was included because the whole document fits the context.
+             */
             retrieval_rank: number;
             quality: components["schemas"]["PassageQuality"];
         };
@@ -841,6 +882,12 @@ export interface components {
             text: string;
             signals: components["schemas"]["RetrievalSignals"];
             quality: components["schemas"]["PassageQuality"];
+            /**
+             * Headings Only
+             * @description Every stored block of the passage is a bare (unnumbered) heading, so it has no substantive text (e.g. a section title on its own). Never used as answer evidence.
+             * @default false
+             */
+            headings_only: boolean;
         };
         /** SectionOut */
         SectionOut: {

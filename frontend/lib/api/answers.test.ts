@@ -8,6 +8,8 @@ const citation = (n: number, status: "verified" | "unverified"): Citation => ({
   proposed_quote: "q",
   cited_evidence_id: "E1",
   location_ambiguous: false,
+  referenced: true,
+  marker_conflict: false,
 });
 
 describe("askDocuments", () => {

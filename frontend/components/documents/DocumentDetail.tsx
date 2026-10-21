@@ -6,6 +6,8 @@ import { AlertCircle, AlertTriangle, ArrowLeft, Download, FileText, RotateCcw, T
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { AnswerPanel } from "@/components/answers/AnswerPanel";
+import { useDocumentQa } from "@/components/answers/useDocumentQa";
 import { DocumentDetailSkeleton } from "@/components/documents/DocumentDetailSkeleton";
 import { DocxViewer, type DocxTarget } from "@/components/documents/DocxViewer";
 import { PdfViewer, type PdfTarget } from "@/components/documents/PdfViewer";
@@ -22,6 +24,11 @@ import { parsePageParam } from "@/lib/pdfHighlights";
 import { coverageSummary, describePages, formatBytes, formatDateTime, isInFlight } from "@/lib/documents";
 
 export function DocumentDetail({ id }: { id: string }) {
+  // Keyed by id: answers, chosen citations and viewer state never carry over to another document.
+  return <DocumentDetailView key={id} id={id} />;
+}
+
+function DocumentDetailView({ id }: { id: string }) {
   const router = useRouter();
   const query = useQuery({
     queryKey: ["document", id],
@@ -30,6 +37,9 @@ export function DocumentDetail({ id }: { id: string }) {
   });
   const actions = useDocumentActions({ onDeleted: () => router.push("/") });
   const linkTarget = useLinkTargets();
+  const qa = useDocumentQa(query.data);
+  // A citation chosen from an answer replaces any preview from the link.
+  const target = qa.target ?? linkTarget;
 
   const backLink = (
     <Link href="/" className={buttonClass("ghost", "-ml-2 self-start")}>
@@ -140,7 +150,7 @@ export function DocumentDetail({ id }: { id: string }) {
         </div>
       ) : null}
 
-      <div className="mt-6 grid flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="mt-6 grid flex-1 gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
       <section aria-label="Document" className="flex flex-col">
         {document.status !== "ready" ? (
           <div className="rounded-xl border border-dashed border-zinc-300 px-4 py-12 text-center text-sm text-zinc-500 dark:border-zinc-700">
@@ -153,7 +163,7 @@ export function DocumentDetail({ id }: { id: string }) {
             documentId={document.id}
             processedAt={document.processed_at}
             fileUrl={documentFileUrl(document.id)}
-            target={linkTarget.pdf}
+            target={target.pdf}
           />
         ) : document.file_type === "pdf" ? (
           <iframe
@@ -162,17 +172,22 @@ export function DocumentDetail({ id }: { id: string }) {
             className="min-h-[70vh] w-full flex-1 rounded-xl border border-zinc-200 bg-white dark:border-zinc-800"
           />
         ) : document.indexed ? (
-          <DocxViewer documentId={document.id} processedAt={document.processed_at} target={linkTarget.docx} />
+          <DocxViewer documentId={document.id} processedAt={document.processed_at} target={target.docx} />
         ) : (
           <div className="rounded-xl border border-zinc-200 bg-white px-4 py-12 text-center text-sm text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
             The text of this Word document isn&apos;t available until it is reprocessed. Use <span className="font-medium">Download</span> to open the original.
           </div>
         )}
       </section>
-      {document.indexed ? (
-        <aside className="flex flex-col gap-4">
-          <IndexPanel document={document} />
-          <OutlinePanel document={document} />
+      {document.indexed || qa.state.phase !== "idle" ? (
+        <aside className="flex min-w-0 flex-col gap-4">
+          <AnswerPanel qa={qa} available={document.indexed} />
+          {document.indexed ? (
+            <>
+              <IndexPanel document={document} />
+              <OutlinePanel document={document} />
+            </>
+          ) : null}
         </aside>
       ) : null}
       </div>

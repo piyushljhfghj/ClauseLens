@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -38,7 +39,10 @@ class EvidenceOut(BaseModel):
     page_start: int | None
     page_end: int | None
     text: str
-    retrieval_rank: int
+    retrieval_rank: int = Field(
+        description="Rank in the search results; 0 when the search did not return the passage "
+        "and it was included because the whole document fits the context."
+    )
     quality: PassageQuality
 
 
@@ -112,6 +116,17 @@ class CitationOut(BaseModel):
         description="Why the citation is unverified; for a verified one, where it was found when "
         "that is not simply the cited passage.",
     )
+    marker_conflict: bool = Field(
+        default=False,
+        description="This citation's number is also used for a different quotation, so which "
+        "statement it supports is unknown; the statements marked with it are not supported.",
+    )
+    referenced: bool = Field(
+        default=True,
+        description="Whether the answer text has a marker [n] for this citation. An unreferenced "
+        "citation supports no statement of the answer (the model may have numbered its markers "
+        "and citations inconsistently).",
+    )
 
 
 class ExcludedPassage(BaseModel):
@@ -119,6 +134,19 @@ class ExcludedPassage(BaseModel):
     chunk_id: int
     retrieval_rank: int
     reason: str
+
+
+class AnswerDocument(BaseModel):
+    """A selected document as of the snapshot the answer was produced from."""
+
+    id: uuid.UUID
+    file_type: Literal["pdf", "docx"]
+    processed_at: datetime | None = Field(
+        description="The document version (when its index was built) that retrieval, quote "
+        "verification and citation locations used; serialized exactly as by the documents API. "
+        "If the document's current `processed_at` differs, it has been reprocessed since and the "
+        "citations' locations must not be shown on it."
+    )
 
 
 class AnswerResponse(BaseModel):
@@ -131,6 +159,10 @@ class AnswerResponse(BaseModel):
         description="Retrieved passages not shown to the model, and why (e.g. weak match)."
     )
     coverage: list[DocumentCoverage]
+    documents: list[AnswerDocument] = Field(
+        description="Every selected document, in the order requested, with the version the "
+        "answer was produced from."
+    )
     notes: list[str]
     unsupported_draft: str | None = Field(
         default=None,

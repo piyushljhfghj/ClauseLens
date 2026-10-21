@@ -303,12 +303,42 @@ says about positions, pages or which occurrence it meant is used.
      or a database error while reading the locations (the verified answer is kept). The citation
      stays verified with no location and `reason` says why. Other errors still propagate.
 6. **Multi-document**: each quote is verified only against its own evidence's document.
-7. **Grounding** (Phase 5, unchanged): grounded / partially grounded / ungrounded (warning, never
-   shown as supported) / not found.
+7. **Grounding**: grounded / partially grounded / ungrounded (warning, never shown as supported) /
+   not found. "Grounded" means every marker has a quotation found word for word in the document
+   and no substantive sentence lacks a marker; it does **not** mean each quotation supports its
+   statement (not checked yet), and the UI labels it "Quotes verified" accordingly. A citation
+   no marker refers to has `referenced: false` and a note (not a downgrade by itself); markers
+   and citation numbers that do not match are reported and never matched up automatically. The
+   output format's tags (`<answer>`, nested or stray) are removed before anything is shown, and
+   the fixed "insufficient support" reply is recognised however it is wrapped (→ not found).
+8. **Statement checks** (`answering/integrity.py`, deterministic, no model call). The answer is
+   split into sentences (a full stop inside quotation marks does not end one; markers stay with
+   the sentence they follow, even after closing quotation marks). Each of these is a note and
+   downgrades the label to "Partly verified":
+   - a substantive sentence with no marker;
+   - text in double quotation marks that is not in the sentence's own verified quotations. A
+     quotation with its own marker right after it is checked against that marker alone, so
+     swapped markers are caught; when markers are grouped (`"A" and "B" [1][2]`) each is checked
+     against all the sentence's quotations. Omissions (`...`, `…`, `[...]`, `[…]`) are allowed,
+     but every kept piece must occur, as whole words and in order, in one quotation;
+   - a number (amount, date, clause or section number) not in the sentence's verified
+     quotations, compared without thousands separators or leading zeros, and matching a number
+     the quotation writes in words ("thirty" = 30, "one hundred and twenty" = 120);
+   - a quotation cited for an *absence statement*, a sentence that only says the passages do
+     not state something. Such a sentence needs no marker and is not counted as unsupported;
+     only plain sentences qualify (one that adds another clause, with "but", "though", "other
+     than", a semicolon, a quotation, ..., is an ordinary statement).
+   The prompt asks for absence statements as separate, unmarked sentences. A reply made only of
+   unmarked absence statements, with no citations, is "not found" and shown in the model's own
+   words (so a corrected false premise stays visible); it is never labelled verified. Any other
+   reply without a verified quotation is still withheld.
 
 **Known limitations and deferred follow-ups**:
 - Verification proves the words exist in the cited document, not that they support the claim
-  they are attached to (claim-level checking is out of scope).
+  they are attached to (claim-level checking is out of scope). The statement checks above catch
+  only some mismatches: an unsupported paraphrase without quoted text or numbers is not
+  detected, an omission can still change a quotation's meaning, and only digits in a statement
+  are checked (a number the statement writes in words, "three strengths", is not).
 - Line-break hyphenation is ambiguous: the quote `resign` verifies against source `re-` + line
   break + `sign`, which may have meant `re-sign` (normalisation joins line-break hyphens).
 - Each answer normalises the whole of every cited document per request (no cache between

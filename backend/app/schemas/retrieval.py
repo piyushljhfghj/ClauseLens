@@ -65,6 +65,12 @@ class RetrievedPassage(BaseModel):
     text: str = Field(description="Exact canonical text of the passage (never modified).")
     signals: RetrievalSignals
     quality: PassageQuality
+    headings_only: bool = Field(
+        default=False,
+        description="Every stored block of the passage is a bare (unnumbered) heading, so it "
+        "has no substantive text (e.g. a section title on its own). Never used as answer "
+        "evidence.",
+    )
 
 
 class DocumentCoverage(BaseModel):
