@@ -270,6 +270,9 @@ class AnswerService:
         citations = await self._add_highlights(citations, sources, versions)
         citations = await self._add_block_ranges(citations, sources, versions)
         markers = set(parsed.markers)
+        citations, repair_note = _repair_passage_marker(markers, citations, parsed.conflicts)
+        if repair_note:
+            notes.append(repair_note)
         citations = [
             c.model_copy(
                 update={"referenced": c.n in markers, "marker_conflict": c.n in parsed.conflicts}
@@ -765,6 +768,38 @@ def _check_output(answer: str, truncated: bool, evidence_texts: list[str]) -> No
             "LLM output rejected", extra={"problem": "repetition", "fragment": ascii(fragment[:60])}
         )
         raise LLMOutputInvalidError(MALFORMED_OUTPUT)
+
+
+def _repair_passage_marker(
+    markers: set[int], citations: list[CitationOut], conflicts: set[int] | frozenset[int]
+) -> tuple[list[CitationOut], str | None]:
+    """Match a marker to its quotation in the one unambiguous case of a known model slip: using
+    the passage number as the citation number ("[11]" for a quotation from E11, numbered [1]).
+
+    Repaired only if all hold: exactly one marker has no citation; exactly one citation is
+    referenced by no marker, and it is verified, not in conflict, and was both cited from and
+    found in passage E<that marker>. That citation is renumbered to the marker, with a note.
+    Anything else is left as it is: reported, never matched up."""
+    numbers = {c.n for c in citations}
+    missing = sorted(markers - numbers)
+    unreferenced = [c for c in citations if c.n not in markers]
+    if len(missing) != 1 or len(unreferenced) != 1:
+        return citations, None
+    marker, citation = missing[0], unreferenced[0]
+    passage = f"E{marker}"
+    if (
+        citation.status != "verified"
+        or citation.n in conflicts
+        or citation.cited_evidence_id != passage
+        or citation.evidence_id != passage
+    ):
+        return citations, None
+    note = (
+        f"Marker [{marker}] had no citation: the model used the passage number. It was matched "
+        f"to the only unreferenced quotation, [{citation.n}], which comes from passage {passage}."
+    )
+    repaired = [c.model_copy(update={"n": marker}) if c is citation else c for c in citations]
+    return repaired, note
 
 
 def _grounding(

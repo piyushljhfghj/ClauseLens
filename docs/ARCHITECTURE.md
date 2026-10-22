@@ -308,7 +308,11 @@ says about positions, pages or which occurrence it meant is used.
    and no substantive sentence lacks a marker; it does **not** mean each quotation supports its
    statement (not checked yet), and the UI labels it "Quotes verified" accordingly. A citation
    no marker refers to has `referenced: false` and a note (not a downgrade by itself); markers
-   and citation numbers that do not match are reported and never matched up automatically. The
+   and citation numbers that do not match are reported and never matched up automatically,
+   with one exception for a known model slip: when exactly one marker has no citation, exactly
+   one citation is unreferenced, and that citation is verified and was cited from and found in
+   passage E<marker> (the model wrote the passage number), it is renumbered to the marker, with
+   a note. The
    output format's tags (`<answer>`, nested or stray) are removed before anything is shown, and
    the fixed "insufficient support" reply is recognised however it is wrapped (→ not found).
 8. **Statement checks** (`answering/integrity.py`, deterministic, no model call). The answer is

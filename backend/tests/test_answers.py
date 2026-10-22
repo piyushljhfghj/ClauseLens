@@ -1589,11 +1589,16 @@ async def test_nested_tags_around_a_cited_answer_are_removed(
 async def test_mismatched_marker_numbers_are_flagged_and_not_matched_up(
     api: httpx.AsyncClient, contract: str, llm: FakeLLM
 ) -> None:
-    # Observed: markers [1] and [3] in the text, citations numbered 1 and 2.
+    # Observed: markers [1] and [3] in the text, citations numbered 1 and 2. The stray marker is
+    # kept off the quotations' passage number here: a marker equal to it is the one slip that is
+    # matched up (test_marker_written_as_the_passage_number_is_matched_to_its_quotation).
+    stray: dict[str, int] = {}
+
     def script(messages: list[ChatMessage]) -> str:
         e = find(evidence_in(messages), "terminate this Agreement")
+        stray["n"] = int(e[1:]) + 5
         return answer_output(
-            "Either party may terminate [1]. Notice must be written [3].",
+            f"Either party may terminate [1]. Notice must be written [{stray['n']}].",
             [
                 {"n": 1, "evidence": e, "quote": "Either party may terminate this Agreement"},
                 {"n": 2, "evidence": e, "quote": "written notice"},
@@ -1607,8 +1612,9 @@ async def test_mismatched_marker_numbers_are_flagged_and_not_matched_up(
     assert by_n[1]["referenced"] is True and by_n[2]["referenced"] is False
     assert by_n[2]["status"] == "verified"  # verified, but supports no statement
     notes = " ".join(result["notes"])
-    assert "[3] have no citation" in notes and "[2] are not referenced" in notes
+    assert f"[{stray['n']}] have no citation" in notes and "[2] are not referenced" in notes
     assert "do not match" in notes
+    assert "used the passage number" not in notes
 
 
 async def test_extra_unreferenced_citation_is_noted_but_does_not_downgrade(
@@ -2187,3 +2193,47 @@ async def test_honest_gap_is_not_penalised_but_a_quotation_cited_for_it_is(
     result = await ask(api, "How do my short-term and long-term goals differ?", journal)
     assert result["grounding"] == "partially_grounded"
     assert any("cannot show that something is missing" in n for n in result["notes"])
+
+
+# --- a marker that is the passage number, end to end ---------------------------------------------
+
+
+async def test_marker_written_as_the_passage_number_is_matched_to_its_quotation(
+    api: httpx.AsyncClient, journal: str, llm: FakeLLM
+) -> None:
+    used: dict[str, str] = {}
+
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Short term:")
+        used["e"] = e
+        return answer_output(
+            f"The short-term goals include a summer internship in data analytics [{e[1:]}].",
+            [_cite(1, e, "finish a summer internship in data analytics")],
+        )
+
+    llm.script = script
+    result = await ask(api, "What are my short-term goals?", journal)
+    assert used["e"] != "E1"  # otherwise marker and number already agree
+    marker = int(used["e"][1:])
+    assert result["grounding"] == "grounded"
+    [citation] = result["citations"]
+    assert citation["n"] == marker and citation["referenced"] is True
+    assert any("used the passage number" in n for n in result["notes"])
+
+
+async def test_marker_that_is_not_the_quotations_passage_stays_unmatched(
+    api: httpx.AsyncClient, journal: str, llm: FakeLLM
+) -> None:
+    def script(messages: list[ChatMessage]) -> str:
+        e = find(evidence_in(messages), "Short term:")
+        wrong = int(e[1:]) + 1
+        return answer_output(
+            f"The short-term goals include a summer internship in data analytics [{wrong}].",
+            [_cite(1, e, "finish a summer internship in data analytics")],
+        )
+
+    llm.script = script
+    result = await ask(api, "What are my short-term goals?", journal)
+    assert result["grounding"] == "partially_grounded"
+    assert result["citations"][0]["n"] == 1 and result["citations"][0]["referenced"] is False
+    assert not any("used the passage number" in n for n in result["notes"])

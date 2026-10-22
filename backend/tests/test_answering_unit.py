@@ -1998,3 +1998,46 @@ def test_only_absence_requires_every_sentence_to_be_a_plain_unmarked_gap() -> No
     assert not only_absence("The passages provided do not state the CGPA [1].")  # a marker
     assert not only_absence("The passages do not state it, but the CGPA is 9.")  # other clause
     assert not only_absence("")
+
+
+# --- a marker that is the passage number (demo contract, Q3/Q8/Q13, 2026-10-22) ----------------
+
+
+def passage_cit(n: int, cited: str, found: str | None = None, verified: bool = True) -> CitationOut:
+    return CitationOut(
+        n=n, status="verified" if verified else "unverified", proposed_quote="q",
+        cited_evidence_id=cited, evidence_id=(found or cited) if verified else None,
+    )  # fmt: skip
+
+
+def test_a_marker_that_is_the_quotations_passage_number_is_matched_up() -> None:
+    from app.answering.service import _repair_passage_marker
+
+    # "... sixty (60) days' written notice [11]." with the quotation numbered [1], from E11.
+    citations, note = _repair_passage_marker({11}, [passage_cit(1, "E11")], set())
+    assert [c.n for c in citations] == [11]
+    assert note is not None and "[11]" in note and "E11" in note
+    # Once matched up, the answer is fully verified.
+    assert _grounding([11], citations)[0] == "grounded"
+
+
+@pytest.mark.parametrize(
+    ("markers", "citations", "conflicts"),
+    [
+        ({11}, [passage_cit(1, "E10")], set()),  # the quotation is from another passage
+        ({11}, [passage_cit(1, "E11", found="E12")], set()),  # found outside the cited passage
+        ({11}, [passage_cit(1, "E11", verified=False)], set()),  # the quotation is unverified
+        ({11, 7}, [passage_cit(1, "E11")], set()),  # two markers without a citation
+        ({11}, [passage_cit(1, "E11"), passage_cit(2, "E7")], set()),  # two unreferenced
+        ({11}, [passage_cit(1, "E11")], {1}),  # its number is in conflict
+        ({1}, [passage_cit(1, "E11")], set()),  # nothing is missing: already consistent
+        ({2, 11}, [passage_cit(2, "E2"), passage_cit(1, "E1")], set()),  # E1 is not E11
+    ],
+)
+def test_anything_less_clear_is_never_matched_up(
+    markers: set[int], citations: list[CitationOut], conflicts: set[int]
+) -> None:
+    from app.answering.service import _repair_passage_marker
+
+    repaired, note = _repair_passage_marker(markers, citations, conflicts)
+    assert note is None and repaired == citations
